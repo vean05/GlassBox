@@ -1,0 +1,7 @@
+bin/
+obj/
+out/
+*.user
+.vs/
+# 编译出来的任务栏助手（发布包里有，源码里只放 GlassTap.cpp）
+GlassTap/bin/
