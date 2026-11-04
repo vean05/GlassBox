@@ -43,16 +43,11 @@ internal sealed class DesktopItem
 /// <summary>按类型分类的规则，对应默认的几个盒子。</summary>
 internal static class Rules
 {
-    public static readonly (string Key, string Name)[] Categories =
-    {
-        ("shortcut", "快捷方式"),
-        ("folder", "文件夹"),
-        ("document", "文档"),
-        ("installer", "程序和安装包"),
-        ("archive", "压缩包"),
-        ("media", "图片影音"),
-        ("other", "其他"),
-    };
+    static readonly string[] Keys = { "shortcut", "folder", "document", "installer", "archive", "media", "other" };
+
+    /// <summary>名字跟着界面语言（L.DefaultNames 前七个就是这七类）。</summary>
+    public static IEnumerable<(string Key, string Name)> Categories =>
+        Keys.Select((key, i) => (key, L.T(L.DefaultNames[i].Zh, L.DefaultNames[i].En)));
 
     static readonly Dictionary<string, string> ByExtension = Build(new()
     {

@@ -1,4 +1,4 @@
-using System.Text.Encodings.Web;
+﻿using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Unicode;
@@ -22,6 +22,8 @@ internal sealed class AppConfig
     public string GlassMode { get; set; } = "acrylic"; // acrylic：系统亚克力；accent：兼容模式
     /// <summary>capsule：顶部的流光胶囊；fences：桌面上的玻璃盒子。每个盒子在胶囊里就是一个分类。</summary>
     public string Layout { get; set; } = "capsule";
+    /// <summary>界面语言：zh / en / auto（跟 Windows 显示语言）。旧配置没有这一项，当中文。</summary>
+    public string Language { get; set; } = "";
     /// <summary>连按两下 Ctrl，在任何窗口上面呼出胶囊。</summary>
     public bool DoubleCtrlToSummon { get; set; } = true;
     /// <summary>胶囊玻璃的透明度 0..100：50 是默认的样子，越大越透、越小越像磨砂实心。</summary>
@@ -38,6 +40,43 @@ internal sealed class AppConfig
     public bool MusicMotion { get; set; } = true;
     /// <summary>音乐卡片旁边显示同步歌词：联网查 lrclib.net，只发歌名、歌手和时长。默认关。</summary>
     public bool Lyrics { get; set; }
+    /// <summary>音乐卡片上显示连着的蓝牙耳机还剩多少电（读系统里已有的电量，只读）。默认关。</summary>
+    public bool BluetoothBattery { get; set; }
+    /// <summary>找歌词时先问网易云音乐（中文歌多，很多有逐字时间）：会把歌名、歌手发给网易云。非官方接口，可能哪天失效。默认关。</summary>
+    public bool NeteaseLyrics { get; set; }
+    /// <summary>音乐卡片的背景换成放大、模糊、慢慢流动的封面。默认关。</summary>
+    public bool MusicBackdrop { get; set; }
+    /// <summary>音乐卡片上的方封面换成唱片机：封面做唱片标签，放歌时转、唱臂落下。默认关。</summary>
+    public bool Turntable { get; set; }
+    /// <summary>音乐卡片可以往下拖出来，变成浮在桌面上的小播放器（拖回屏幕顶部收回胶囊）。默认关。</summary>
+    public bool MusicFloat { get; set; }
+    /// <summary>拖出来的小播放器上次放在哪（屏幕像素，卡片左上角）；int.MinValue = 还没放过。</summary>
+    public int MusicFloatX { get; set; } = int.MinValue;
+    public int MusicFloatY { get; set; } = int.MinValue;
+    /// <summary>在放歌时连按两下 Ctrl：打开音乐卡片并锁住（再按一次收起）。默认关。</summary>
+    public bool CtrlLocksMusic { get; set; }
+    /// <summary>音乐卡片上点输出设备，可以在音箱和耳机之间切换（会改 Windows 的默认输出设备）。默认关。</summary>
+    public bool OutputSwitch { get; set; }
+    /// <summary>YouTube 出现“跳过”按钮时，胶囊上可以直接点跳过（用辅助功能接口按网页上的按钮）。默认关。</summary>
+    public bool SkipAds { get; set; }
+    /// <summary>能跳过的广告一出现就自动跳过（要先开 SkipAds）。默认关。</summary>
+    public bool AutoSkipAds { get; set; }
+    /// <summary>外文歌的歌词下面显示中文翻译（网易云带的，要开网易云歌词）。默认关。</summary>
+    public bool LyricTranslation { get; set; }
+    /// <summary>YouTube 放久了问“仍在观看吗？”、把视频停下时，自动点“继续”（要装自带的 Edge 扩展）。默认关。</summary>
+    public bool KeepWatching { get; set; }
+    /// <summary>收起时胶囊上一行行滚当前那句歌词（要同步歌词开着）。默认关。</summary>
+    public bool PillLyrics { get; set; }
+    /// <summary>插上充电器时胶囊上亮一下电池和一道绿光。默认关。</summary>
+    public bool ChargeEffect { get; set; }
+    /// <summary>天色光：胶囊里透出一团跟着早晚变的天空颜色（太阳从左走到右，夜里有几颗星）。默认关。</summary>
+    public bool SkyGlow { get; set; }
+    /// <summary>截图像飞进胶囊一样：刚截的图先在屏幕中间定格一下，再缩小飞进胶囊。默认关。</summary>
+    public bool ShotFly { get; set; }
+    /// <summary>番茄钟：面板上多一个计时按钮；专注时胶囊显示倒计时，提示先攒着、动画停下来。默认关。</summary>
+    public bool FocusTimer { get; set; }
+    /// <summary>一次专注多少分钟（15 / 25 / 45 / 60）。</summary>
+    public int FocusMinutes { get; set; } = 25;
     /// <summary>顶部胶囊自动隐藏：平时缩到屏幕顶上，鼠标碰到顶边才滑下来，浮在所有窗口上面。</summary>
     public bool CapsuleAutoHide { get; set; }
     /// <summary>Windows 任务栏的样子：0 原样，1 透明，2 磨砂（见 TaskbarStyle）。</summary>
@@ -64,7 +103,7 @@ internal sealed class UsageEntry
 internal sealed class FenceConfig
 {
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
-    public string Name { get; set; } = "新建盒子";
+    public string Name { get; set; } = L.T("新建盒子", "New box");
     /// <summary>新文件按类型自动收纳到这个盒子；null 表示不自动收纳。</summary>
     public string? Category { get; set; }
     public int X { get; set; }

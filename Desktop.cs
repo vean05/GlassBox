@@ -310,7 +310,7 @@ internal static class AutoStart
               <Actions Context="Author"><Exec><Command>{SecurityElement.Escape(Exe)}</Command><Arguments>--autostart</Arguments></Exec></Actions>
             </Task>
             """;
-        string path = Path.Combine(Path.GetTempPath(), "GlassBox.task.xml");
+        string path = Path.Combine(Path.GetTempPath(), $"GlassBox.task.{Guid.NewGuid():N}.xml"); // 每次随机名：别的程序没法事先放一份等着被注册
         File.WriteAllText(path, xml, Encoding.Unicode);
         try
         {

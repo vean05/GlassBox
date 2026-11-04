@@ -83,9 +83,12 @@ internal sealed class GlassBoxApp : ApplicationContext
 
         var loaded = ConfigStore.Load();
         Config = loaded ?? new AppConfig();
+        if (Config.Language is not ("zh" or "en" or "auto")) Config.Language = loaded == null ? "auto" : "zh";
+        L.Use(Config.Language);
         var scanned = Scan();
         if (loaded == null) CreateDefaultFences(scanned.Values);
         EnsureAnyFence();
+        if (L.RenameDefaults(Config.Fences)) ScheduleSave();
         PruneUsage();
         Reconcile(scanned, sortByCategory: loaded == null || Config.AutoSortNewFiles);
 
@@ -193,7 +196,7 @@ internal sealed class GlassBoxApp : ApplicationContext
         var added = items.Values.Where(i => !before.Contains(i.Path) && !i.External && !Rules.IsPartialDownload(i))
             .OrderByDescending(i => i.Created).ToList();
         if (added.Count > 0 && FenceOf(added[0].Path) is { } fence)
-            capsule?.ShowFiled(added[0], fence, added.Count > 1 ? $"{added.Count} 个新文件已收进" : "新文件已收进");
+            capsule?.ShowFiled(added[0], fence, added.Count > 1 ? L.T($"{added.Count} 个新文件已收进", $"{added.Count} new files filed into") : L.T("新文件已收进", "New file filed into"));
         CheckDownloads();
     }
 
@@ -231,7 +234,7 @@ internal sealed class GlassBoxApp : ApplicationContext
         if (Rules.IsPartialDownload(oldItem) && !Rules.IsPartialDownload(item) && into != null)
         {
             CheckDownloads();
-            capsule?.ShowFiled(item, into, "下载完成，已收进");
+            capsule?.ShowFiled(item, into, L.T("下载完成，已收进", "Downloaded, filed into"));
         }
     }
 
@@ -531,7 +534,7 @@ internal sealed class GlassBoxApp : ApplicationContext
     public string CategoryNameFor(string path)
     {
         var item = items.TryGetValue(path, out var known) ? known : DesktopItem.FromPath(path, external: true);
-        return item == null ? "对应分类" : TargetFor(item, true).Name;
+        return item == null ? L.T("对应分类", "its category") : TargetFor(item, true).Name;
     }
 
     /// <summary>拖到胶囊上的文件：按类型收进对应分类（或者指定的分类）。只记引用，不动文件。</summary>
@@ -588,7 +591,7 @@ internal sealed class GlassBoxApp : ApplicationContext
         var area = Screen.PrimaryScreen!.WorkingArea;
         Config.Fences.Add(new FenceConfig
         {
-            Name = "桌面", Category = "other",
+            Name = L.T("桌面", "Desktop"), Category = "other",
             X = area.Left + 24, Y = area.Top + 24, W = (int)(360 * UiScale), H = (int)(300 * UiScale),
         });
     }
@@ -718,7 +721,7 @@ internal sealed class GlassBoxApp : ApplicationContext
         int w = (int)(320 * UiScale), h = (int)(240 * UiScale);
         var config = new FenceConfig
         {
-            Name = CapsuleMode ? "新建分类" : "新建盒子",
+            Name = CapsuleMode ? L.T("新建分类", "New category") : L.T("新建盒子", "New box"),
             X = Math.Clamp(at.X - w / 2, area.Left, area.Right - w),
             Y = Math.Clamp(at.Y - (int)(16 * UiScale), area.Top, area.Bottom - h),
             W = w,
@@ -733,7 +736,7 @@ internal sealed class GlassBoxApp : ApplicationContext
 
     void RenameFence(FenceConfig fence, Point near)
     {
-        var name = InputDialog.Show(CapsuleMode ? "重命名分类" : "重命名盒子", fence.Name, near);
+        var name = InputDialog.Show(CapsuleMode ? L.T("重命名分类", "Rename category") : L.T("重命名盒子", "Rename box"), fence.Name, near);
         if (string.IsNullOrWhiteSpace(name)) return;
         fence.Name = name;
         RefreshViews();
@@ -744,9 +747,9 @@ internal sealed class GlassBoxApp : ApplicationContext
     {
         var target = Config.Fences.FirstOrDefault(f => f != fence && f.Category == "other") ?? Config.Fences.FirstOrDefault(f => f != fence);
         if (target == null) return;
-        string kind = CapsuleMode ? "分类" : "盒子";
-        var answer = MessageBox.Show($"删除{kind}“{fence.Name}”？\n\n里面的文件不会被删除，会移到“{target.Name}”。",
-            "玻璃收纳", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+        string kind = CapsuleMode ? L.T("分类", "category") : L.T("盒子", "box");
+        var answer = MessageBox.Show(L.T($"删除{kind}“{fence.Name}”？\n\n里面的文件不会被删除，会移到“{target.Name}”。", $"Delete {kind} “{fence.Name}”?\n\nThe files inside won't be deleted, they'll move to “{target.Name}”."),
+            L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (answer != DialogResult.OK) return;
 
         target.Items.AddRange(fence.Items);
@@ -787,8 +790,8 @@ internal sealed class GlassBoxApp : ApplicationContext
 
     void ReorganizeAll()
     {
-        var answer = MessageBox.Show("把所有文件按类型重新分到对应的分类？\n\n你手动调整过的位置会被覆盖（文件本身不会动）。",
-            "玻璃收纳", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+        var answer = MessageBox.Show(L.T("把所有文件按类型重新分到对应的分类？\n\n你手动调整过的位置会被覆盖（文件本身不会动）。", "Re-sort every file into categories by type?\n\nYour manual arrangement will be replaced (the files themselves won't move)."),
+            L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (answer != DialogResult.OK) return;
         foreach (var fence in Config.Fences) fence.Items.Clear();
         foreach (var item in items.Values.OrderBy(i => i.Name, Logical))
@@ -878,7 +881,7 @@ internal sealed class GlassBoxApp : ApplicationContext
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) { } // 用户取消了 UAC
         catch (Exception ex)
         {
-            MessageBox.Show($"打不开“{item.Name}”：\n{ex.Message}", "玻璃收纳", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(L.T($"打不开“{item.Name}”：\n{ex.Message}", $"Couldn't open “{item.Name}”:\n{ex.Message}"), L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -887,11 +890,11 @@ internal sealed class GlassBoxApp : ApplicationContext
         ShellMenu.Show(menuHost, item.Path, at, menu =>
         {
             // “下载”文件夹里的文件还不在任何分类里：这里就是“收进分类”
-            var move = menu.Sub(fence == null ? "收进分类" : CapsuleMode ? "移到分类" : "移动到盒子", Config.Fences.Count > (fence == null ? 0 : 1));
+            var move = menu.Sub(fence == null ? L.T("收进分类", "File into category") : CapsuleMode ? L.T("移到分类", "Move to category") : L.T("移动到盒子", "Move to box"), Config.Fences.Count > (fence == null ? 0 : 1));
             foreach (var other in Config.Fences.Where(f => f != fence).ToList())
                 move.Add(other.Name, () => AddPaths(new[] { item.Path }, other, -1));
-            menu.Add("打开文件所在位置", () => Process.Start("explorer.exe", $"/select,\"{item.Path}\""));
-            if (item.External && fence != null) menu.Add(CapsuleMode ? "从收纳中移除（不删除文件）" : "从盒子中移除（不删除文件）", () => RemoveReference(item.Path));
+            menu.Add(L.T("打开文件所在位置", "Open file location"), () => Process.Start("explorer.exe", $"/select,\"{item.Path}\""));
+            if (item.External && fence != null) menu.Add(CapsuleMode ? L.T("从收纳中移除（不删除文件）", "Remove from GlassBox (file is kept)") : L.T("从盒子中移除（不删除文件）", "Remove from box (file is kept)"), () => RemoveReference(item.Path));
         }, verb =>
         {
             if (!verb.Equals("rename", StringComparison.OrdinalIgnoreCase)) return false;
@@ -905,7 +908,7 @@ internal sealed class GlassBoxApp : ApplicationContext
         string fileName = Path.GetFileName(item.Path);
         string shown = item.HidesExtension ? Path.GetFileNameWithoutExtension(fileName) : fileName;
         int stem = item.IsDir || item.HidesExtension ? -1 : Path.GetFileNameWithoutExtension(fileName).Length;
-        var name = InputDialog.Show("重命名", shown, at, stem);
+        var name = InputDialog.Show(L.T("重命名", "Rename"), shown, at, stem);
         if (string.IsNullOrWhiteSpace(name) || name == shown) return;
         if (item.HidesExtension) name += item.Ext;
 
@@ -918,32 +921,35 @@ internal sealed class GlassBoxApp : ApplicationContext
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"重命名失败：\n{ex.Message}", "玻璃收纳", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(L.T($"重命名失败：\n{ex.Message}", $"Rename failed:\n{ex.Message}"), L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
     public void ShowFenceMenu(FenceWindow window, Point at)
     {
         using var menu = new PopupMenu();
-        menu.Add("新建盒子", () => NewFence(at));
+        menu.Add(L.T("新建盒子", "New box"), () => NewFence(at));
         AddFenceItems(menu, window.Config, at);
-        menu.Add(window.Config.Collapsed ? "展开" : "折叠", window.ToggleCollapse);
-        menu.Add("删除盒子…", () => DeleteFence(window.Config), enabled: Config.Fences.Count > 1);
+        menu.Add(window.Config.Collapsed ? L.T("展开", "Expand") : L.T("折叠", "Collapse"), window.ToggleCollapse);
+        menu.Add(L.T("删除盒子…", "Delete box…"), () => DeleteFence(window.Config), enabled: Config.Fences.Count > 1);
         menu.Separator();
         AddCommonItems(menu, at);
         menu.Show(at, menuHost.Handle);
     }
 
     /// <summary>胶囊上的右键菜单；在某个分类上点的话，带上这个分类的操作。</summary>
+    /// <summary>胶囊自己的菜单（音乐卡片右键）也挂在这个隐藏窗口上，点外面才会消失。</summary>
+    public IntPtr MenuOwner => menuHost.Handle;
+
     public void ShowCapsuleMenu(FenceConfig? fence, Point at)
     {
         using var menu = new PopupMenu();
-        menu.Add("新建分类", () => NewFence(at));
+        menu.Add(L.T("新建分类", "New category"), () => NewFence(at));
         if (fence != null)
         {
             menu.Separator();
             AddFenceItems(menu, fence, at);
-            menu.Add($"删除分类“{fence.Name}”…", () => DeleteFence(fence), enabled: Config.Fences.Count > 1);
+            menu.Add(L.T($"删除分类“{fence.Name}”…", $"Delete category “{fence.Name}”…"), () => DeleteFence(fence), enabled: Config.Fences.Count > 1);
         }
         menu.Separator();
         AddCommonItems(menu, at);
@@ -952,65 +958,68 @@ internal sealed class GlassBoxApp : ApplicationContext
 
     void AddFenceItems(PopupMenu menu, FenceConfig fence, Point at)
     {
-        menu.Add(CapsuleMode ? $"重命名分类“{fence.Name}”…" : "重命名盒子…", () => RenameFence(fence, at));
-        var sort = menu.Sub("排序", fence.Items.Count > 1);
-        sort.Add("按名称", () => SortFence(fence, "name"));
-        sort.Add("按类型", () => SortFence(fence, "type"));
-        sort.Add("按修改时间", () => SortFence(fence, "date"));
-        var auto = menu.Sub("新文件自动收纳到这里");
-        auto.Add("不自动收纳", () => SetCategory(fence, null), check: fence.Category == null);
+        menu.Add(CapsuleMode ? L.T($"重命名分类“{fence.Name}”…", $"Rename category “{fence.Name}”…") : L.T("重命名盒子…", "Rename box…"), () => RenameFence(fence, at));
+        var sort = menu.Sub(L.T("排序", "Sort"), fence.Items.Count > 1);
+        sort.Add(L.T("按名称", "By name"), () => SortFence(fence, "name"));
+        sort.Add(L.T("按类型", "By type"), () => SortFence(fence, "type"));
+        sort.Add(L.T("按修改时间", "By date modified"), () => SortFence(fence, "date"));
+        var auto = menu.Sub(L.T("新文件自动收纳到这里", "Auto-file new files here"));
+        auto.Add(L.T("不自动收纳", "Don't auto-file"), () => SetCategory(fence, null), check: fence.Category == null);
         foreach (var (key, name) in Rules.Categories)
             auto.Add(name, () => SetCategory(fence, key), check: fence.Category == key);
     }
 
     void AddCommonItems(PopupMenu menu, Point at)
     {
-        string what = CapsuleMode ? "胶囊" : "所有盒子";
-        menu.Add(hidden ? $"显示{what}" : $"隐藏{what}", () => SetHidden(!hidden));
-        menu.Add("按类型重新整理全部…", ReorganizeAll);
-        var layout = menu.Sub("显示方式");
-        layout.Add("流光胶囊（屏幕顶部）", () => SetLayout("capsule"), check: CapsuleMode);
-        layout.Add("玻璃盒子（摆在桌面上）", () => SetLayout("fences"), check: !CapsuleMode);
-        var settings = menu.Sub("设置");
-        settings.Add("开机自动启动", ToggleAutoStart, check: AutoStart.Enabled);
-        var taskbar = settings.Sub("Windows 任务栏效果");
-        taskbar.Add("原样", () => SetTaskbarStyle(TaskbarStyle.Normal), check: Config.TaskbarStyle == TaskbarStyle.Normal);
-        taskbar.Add("透明", () => SetTaskbarStyle(TaskbarStyle.Clear), check: Config.TaskbarStyle == TaskbarStyle.Clear);
-        taskbar.Add("磨砂", () => SetTaskbarStyle(TaskbarStyle.Frost), check: Config.TaskbarStyle == TaskbarStyle.Frost);
-        if (CapsuleMode) settings.Add("顶部胶囊自动隐藏", () => SetCapsuleAutoHide(!Config.CapsuleAutoHide), check: Config.CapsuleAutoHide);
-        settings.Add("双击桌面空白处隐藏/显示", () => SetDoubleClickToHide(!Config.DoubleClickToHide), check: Config.DoubleClickToHide);
+        string what = CapsuleMode ? L.T("胶囊", "capsule") : L.T("所有盒子", "all boxes");
+        menu.Add(hidden ? L.T($"显示{what}", $"Show {what}") : L.T($"隐藏{what}", $"Hide {what}"), () => SetHidden(!hidden));
+        menu.Add(L.T("按类型重新整理全部…", "Re-sort everything by type…"), ReorganizeAll);
+        var layout = menu.Sub(L.T("显示方式", "Layout"));
+        layout.Add(L.T("流光胶囊（屏幕顶部）", "Glow capsule (top of screen)"), () => SetLayout("capsule"), check: CapsuleMode);
+        layout.Add(L.T("玻璃盒子（摆在桌面上）", "Glass boxes (on the desktop)"), () => SetLayout("fences"), check: !CapsuleMode);
+        var settings = menu.Sub(L.T("设置", "Settings"));
+        settings.Add(L.T("开机自动启动", "Start with Windows"), ToggleAutoStart, check: AutoStart.Enabled);
+        var language = settings.Sub("语言 / Language");
+        language.Add("中文", () => SetLanguage("zh"), check: !L.En);
+        language.Add("English", () => SetLanguage("en"), check: L.En);
+        var taskbar = settings.Sub(L.T("Windows 任务栏效果", "Windows taskbar effect"));
+        taskbar.Add(L.T("原样", "Normal"), () => SetTaskbarStyle(TaskbarStyle.Normal), check: Config.TaskbarStyle == TaskbarStyle.Normal);
+        taskbar.Add(L.T("透明", "Clear"), () => SetTaskbarStyle(TaskbarStyle.Clear), check: Config.TaskbarStyle == TaskbarStyle.Clear);
+        taskbar.Add(L.T("磨砂", "Frosted"), () => SetTaskbarStyle(TaskbarStyle.Frost), check: Config.TaskbarStyle == TaskbarStyle.Frost);
+        if (CapsuleMode) settings.Add(L.T("顶部胶囊自动隐藏", "Auto-hide top capsule"), () => SetCapsuleAutoHide(!Config.CapsuleAutoHide), check: Config.CapsuleAutoHide);
+        settings.Add(L.T("双击桌面空白处隐藏/显示", "Double-click desktop to hide/show"), () => SetDoubleClickToHide(!Config.DoubleClickToHide), check: Config.DoubleClickToHide);
         if (CapsuleMode)
-            settings.Add("连按两下 Ctrl 呼出胶囊", () => SetDoubleCtrlToSummon(!Config.DoubleCtrlToSummon), check: Config.DoubleCtrlToSummon);
+            settings.Add(L.T("连按两下 Ctrl 呼出胶囊", "Ctrl twice to summon the capsule"), () => SetDoubleCtrlToSummon(!Config.DoubleCtrlToSummon), check: Config.DoubleCtrlToSummon);
         if (!CapsuleMode)
-            settings.Add("鼠标悬停时展开折叠的盒子", () =>
+            settings.Add(L.T("鼠标悬停时展开折叠的盒子", "Expand collapsed boxes on hover"), () =>
             {
                 Config.HoverExpand = !Config.HoverExpand;
                 ScheduleSave();
             }, check: Config.HoverExpand);
-        settings.Add("新文件自动按类型收纳", () =>
+        settings.Add(L.T("新文件自动按类型收纳", "Auto-file new files by type"), () =>
         {
             Config.AutoSortNewFiles = !Config.AutoSortNewFiles;
             ScheduleSave();
         }, check: Config.AutoSortNewFiles);
-        settings.Add("隐藏系统桌面图标", () => SetHideSystemIcons(!Config.HideSystemIcons), check: Config.HideSystemIcons);
+        settings.Add(L.T("隐藏系统桌面图标", "Hide system desktop icons"), () => SetHideSystemIcons(!Config.HideSystemIcons), check: Config.HideSystemIcons);
         if (!CapsuleMode)
-            settings.Add("毛玻璃兼容模式（效果不对时再开）", () =>
+            settings.Add(L.T("毛玻璃兼容模式（效果不对时再开）", "Glass compatibility mode (if blur looks wrong)"), () =>
             {
                 Config.GlassMode = Config.GlassMode == "accent" ? "acrylic" : "accent";
                 foreach (var fence in fences) fence.ApplyTheme();
                 ScheduleSave();
             }, check: Config.GlassMode == "accent");
         settings.Separator();
-        settings.Add("打开配置文件夹", () => Process.Start("explorer.exe", $"\"{ConfigStore.Dir}\""));
-        settings.Add("卸载玻璃收纳…", () => Process.Start(Environment.ProcessPath!, "--uninstall"));
+        settings.Add(L.T("打开配置文件夹", "Open config folder"), () => Process.Start("explorer.exe", $"\"{ConfigStore.Dir}\""));
+        settings.Add(L.T("卸载玻璃收纳…", "Uninstall GlassBox…"), () => Process.Start(Environment.ProcessPath!, "--uninstall"));
         menu.Separator();
-        menu.Add("退出", Exit);
+        menu.Add(L.T("退出", "Exit"), Exit);
     }
 
     internal void ToggleAutoStart()
     {
         try { AutoStart.Enabled = !AutoStart.Enabled; }
-        catch (Exception ex) { MessageBox.Show($"设置开机启动失败：\n{ex.Message}", "玻璃收纳"); }
+        catch (Exception ex) { MessageBox.Show(L.T($"设置开机启动失败：\n{ex.Message}", $"Couldn't set start with Windows:\n{ex.Message}"), L.T("玻璃收纳", "GlassBox")); }
     }
 
     // 胶囊里的设置卡片用：跟托盘菜单里的开关是同一套
@@ -1075,18 +1084,32 @@ internal sealed class GlassBoxApp : ApplicationContext
             Config.TaskbarStyle = TaskbarStyle.Normal;
             ScheduleSave();
             capsule?.Redraw();
-            MessageBox.Show($"任务栏效果没能打开：\n{error}", "玻璃收纳", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(L.T($"任务栏效果没能打开：\n{error}", $"Couldn't turn on the taskbar effect:\n{error}"), L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OK, MessageBoxIcon.Information);
         }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    static string TrayText => L.T("玻璃收纳（双击隐藏/显示）", "GlassBox (double-click to hide/show)");
+
+    /// <summary>切换界面语言：自带的分类名跟着换，胶囊、托盘马上重画。</summary>
+    internal void SetLanguage(string language)
+    {
+        Config.Language = language;
+        L.Use(language);
+        L.RenameDefaults(Config.Fences);
+        tray.Text = TrayText;
+        capsule?.LanguageChanged();
+        RefreshViews();
+        ScheduleSave();
     }
 
     NotifyIcon CreateTray()
     {
-        var icon = new NotifyIcon { Icon = AppIcon.Create(), Text = "玻璃收纳（双击隐藏/显示）", Visible = true };
+        var icon = new NotifyIcon { Icon = AppIcon.Create(), Text = TrayText, Visible = true };
         icon.MouseUp += (_, e) =>
         {
             if (e.Button != MouseButtons.Right) return;
             using var menu = new PopupMenu();
-            menu.Add(CapsuleMode ? "新建分类" : "新建盒子", () => NewFence(Cursor.Position));
+            menu.Add(CapsuleMode ? L.T("新建分类", "New category") : L.T("新建盒子", "New box"), () => NewFence(Cursor.Position));
             AddCommonItems(menu, Cursor.Position);
             menu.Show(Cursor.Position, menuHost.Handle);
         };

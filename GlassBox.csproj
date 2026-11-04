@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -10,7 +10,7 @@
     <AssemblyName>GlassBox</AssemblyName>
     <RootNamespace>GlassBox</RootNamespace>
     <Product>玻璃收纳</Product>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationVisualStyles>true</ApplicationVisualStyles>
     <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
@@ -28,6 +28,10 @@
     <!-- 任务栏透明用的小 DLL（C++，GlassTap\build.cmd 编译），放在 exe 旁边 -->
     <!-- 没编译它也能编译主程序，只是“任务栏透明”用不了；单文件发布时它留在 exe 外面（要被载进资源管理器） -->
     <None Include="GlassTap\bin\GlassTap.dll" Link="GlassTap.dll" Condition="Exists('GlassTap\bin\GlassTap.dll')"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <!-- 自带的 Edge 扩展（YouTube 跳过广告）：原样放在 exe 旁边的 edge-extension 文件夹，用户在 Edge 里“加载解压缩的扩展” -->
+    <None Remove="EdgeExtension\**" />
+    <None Include="EdgeExtension\**" Link="edge-extension\%(RecursiveDir)%(Filename)%(Extension)"
           CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
 

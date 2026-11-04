@@ -1,4 +1,4 @@
-using System.Drawing.Drawing2D;
+﻿using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 
@@ -8,16 +8,18 @@ namespace GlassBox;
 /// <param name="Art">96×96 的方形封面（取色、小图用）。</param>
 /// <param name="Cover">保持原比例的大封面（视频是 16:9），上下的黑边已经切掉。</param>
 /// <param name="Sources">现在所有在报播放状态的程序（同时开着 YouTube 和 Spotify 时可以切换）。</param>
+/// <param name="Rate">播放速度（YouTube 调成 1.25 倍之类的；报不出来就是 1）。</param>
+/// <param name="Settling">刚换歌、播放器报的进度还是上一首的：先从 0 算，时长不知道，等它报新的。</param>
 internal sealed record NowPlaying(string Title, string Artist, string Source, bool Playing, TimeSpan Position, TimeSpan Duration, DateTime UpdatedUtc,
-    Bitmap? Art, Bitmap? Cover, string[] Sources)
+    Bitmap? Art, Bitmap? Cover, string[] Sources, double Rate = 1, bool Settling = false)
 {
-    /// <summary>播放器只在暂停、拖进度时报一次位置，中间按时间往前推。</summary>
+    /// <summary>播放器只在暂停、拖进度时报一次位置，中间按时间（乘上播放速度）往前推。</summary>
     public TimeSpan CurrentPosition
     {
         get
         {
             if (!Playing) return Position;
-            var now = Position + (DateTime.UtcNow - UpdatedUtc);
+            var now = Position + (DateTime.UtcNow - UpdatedUtc) * Rate;
             return Duration > TimeSpan.Zero && now > Duration ? Duration : now;
         }
     }
@@ -42,7 +44,7 @@ internal sealed unsafe class MediaWatcher : IDisposable
         SessionSkipNext = 16, SessionSkipPrevious = 17, SessionTogglePlayPause = 20, SessionChangePosition = 24;
     const int VectorGetAt = 6, VectorSize = 7;
     const int PropsTitle = 6, PropsArtist = 9, PropsThumbnail = 15;
-    const int InfoPlaybackStatus = 7, StatusPlaying = 4;
+    const int InfoPlaybackStatus = 7, InfoPlaybackRate = 10, StatusPlaying = 4, ReferenceValue = 6;
     const int TimelineStart = 6, TimelineEnd = 7, TimelinePosition = 10, TimelineUpdated = 11;
     const int AsyncInfoStatus = 7, AsyncInfoCancel = 9, AsyncOperationGetResults = 8;
     const int StreamReferenceOpenRead = 6, StreamRead = 3;
@@ -96,6 +98,10 @@ internal sealed unsafe class MediaWatcher : IDisposable
         IntPtr manager = IntPtr.Zero;
         string artKey = "";
         (Bitmap? Art, Bitmap? Cover) art = default;
+        string songKey = "";
+        (DateTime Updated, TimeSpan Duration, TimeSpan Position) oldLine = default; // 上一首最后报的进度
+        DateTime songSeen = default;
+        bool settling = false;
         while (!stopped)
         {
             int wait;
@@ -112,12 +118,46 @@ internal sealed unsafe class MediaWatcher : IDisposable
                         command = Command.Pause;
                     }
                     var next = Read(manager, command, Interlocked.Read(ref seekTicks), preferred, ref artKey, ref art);
+                    // 刚按了上一首/下一首：播放器要一会儿才报出新歌名，这期间读到的是“没在放”，再等等（最多约 2 秒）
+                    for (int retry = 0; retry < 8 && next == null && Current != null && command != Command.None && !stopped && Volatile.Read(ref pending) == 0; retry++)
+                    {
+                        Thread.Sleep(250);
+                        next = Read(manager, Command.None, 0, preferred, ref artKey, ref art);
+                    }
+                    // 什么都没在放：封面交给界面去释放了，这边别再留着用（同一首歌回来时要重新读，不然会画已经释放的图）
+                    if (next == null)
+                    {
+                        artKey = "";
+                        art = default;
+                    }
+                    if (next != null)
+                    {
+                        // 换歌时播放器（尤其 Edge 里的 YouTube）常常先报新歌名，进度和时长过一会儿才换；
+                        // 这期间报的还是上一首的，照着推进度条会一直停在上一首。认出来就先从 0 算，等它报新的。
+                        var line = (next.UpdatedUtc, next.Duration, next.Position);
+                        string key = next.Source + "\n" + next.Title + "\n" + next.Artist;
+                        if (key != songKey)
+                        {
+                            settling = songKey.Length > 0 && next.Duration > TimeSpan.Zero
+                                && (line == oldLine || next.Duration == oldLine.Duration && next.Position > TimeSpan.FromSeconds(3));
+                            songKey = key;
+                            songSeen = DateTime.UtcNow;
+                        }
+                        else if (settling)
+                        {
+                            bool fresh = line != oldLine && (next.Duration != oldLine.Duration || next.Position < TimeSpan.FromSeconds(3));
+                            if (fresh || DateTime.UtcNow - songSeen > TimeSpan.FromSeconds(8)) settling = false; // 8 秒还没报：就信它的
+                        }
+                        if (settling)
+                            next = next with { Position = TimeSpan.Zero, Duration = TimeSpan.Zero, UpdatedUtc = songSeen, Settling = true };
+                        else oldLine = line;
+                    }
                     if (!Same(next, Current))
                     {
                         Current = next;
                         Changed?.Invoke(next);
                     }
-                    wait = next?.Playing == true ? 1000 : 2500;
+                    wait = next?.Settling == true ? 400 : next?.Playing == true ? 1000 : 2500; // 等新进度时看勤一点
                 }
                 if (SleepAtUtc is { } at) wait = (int)Math.Clamp((at - DateTime.UtcNow).TotalMilliseconds + 50, 50, wait);
             }
@@ -138,7 +178,7 @@ internal sealed unsafe class MediaWatcher : IDisposable
     static bool Same(NowPlaying? a, NowPlaying? b) =>
         a == null || b == null ? a == b
         : a.Title == b.Title && a.Artist == b.Artist && a.Source == b.Source && a.Playing == b.Playing && a.Art == b.Art
-          && a.Duration == b.Duration && Math.Abs((a.CurrentPosition - b.CurrentPosition).TotalSeconds) < 1.5
+          && a.Duration == b.Duration && a.Settling == b.Settling && Math.Abs(a.Rate - b.Rate) < .01 && Math.Abs((a.CurrentPosition - b.CurrentPosition).TotalSeconds) < .5
           && a.Sources.AsSpan().SequenceEqual(b.Sources);
 
     static NowPlaying? Read(IntPtr manager, Command command, long seek, string? preferred, ref string artKey, ref (Bitmap? Art, Bitmap? Cover) art)
@@ -179,6 +219,17 @@ internal sealed unsafe class MediaWatcher : IDisposable
             string source = GetString(session, SessionSourceApp);
             IntPtr info = GetObject(session, SessionPlaybackInfo);
             int status = info == IntPtr.Zero ? 0 : GetInt(info, InfoPlaybackStatus);
+            double rate = 1;
+            if (info != IntPtr.Zero)
+            {
+                IntPtr boxed = GetObject(info, InfoPlaybackRate); // IReference<double>，播放器没报就是空的
+                if (boxed != IntPtr.Zero)
+                {
+                    double value;
+                    if (((delegate* unmanaged<IntPtr, double*, int>)Slot(boxed, ReferenceValue))(boxed, &value) >= 0 && value is > .2 and < 5) rate = value;
+                    Release(ref boxed);
+                }
+            }
             Release(ref info);
 
             string title = "", artist = "";
@@ -188,7 +239,7 @@ internal sealed unsafe class MediaWatcher : IDisposable
                 title = GetString(props, PropsTitle);
                 artist = GetString(props, PropsArtist);
                 string key = source + "\n" + title + "\n" + artist;
-                if (key != artKey)
+                if (title.Length > 0 && key != artKey) // 没歌名的不读封面：这次会报“没在放”，读了也没人要
                 {
                     artKey = key;
                     art = LoadArt(props); // 旧封面由界面那边换下来时释放
@@ -210,7 +261,7 @@ internal sealed unsafe class MediaWatcher : IDisposable
             var updatedUtc = updated > 0 ? DateTime.FromFileTimeUtc(updated) : DateTime.UtcNow;
             return new NowPlaying(title, artist, source, status == StatusPlaying,
                 TimeSpan.FromTicks(Math.Max(0, position - start)), TimeSpan.FromTicks(Math.Max(0, end - start)), updatedUtc,
-                art.Art, art.Cover, sources.ToArray());
+                art.Art, art.Cover, sources.ToArray(), rate);
         }
         finally { Release(ref session); }
     }

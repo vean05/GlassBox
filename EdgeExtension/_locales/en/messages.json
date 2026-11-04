@@ -1,0 +1,5 @@
+{
+  "name": { "message": "GlassBox · YouTube ad skip" },
+  "short": { "message": "GlassBox" },
+  "desc": { "message": "Tells GlassBox when a YouTube ad shows its Skip button, so you can skip it with one click on the capsule, or automatically. It presses the button through the browser's own input channel (Edge briefly shows a \"being debugged\" bar). Runs only on YouTube and only talks to GlassBox on this PC." }
+}

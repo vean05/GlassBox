@@ -63,23 +63,23 @@ internal static class TaskbarStyle
         lock (Gate)
         {
             var tray = FindWindow("Shell_TrayWnd", null);
-            if (tray == IntPtr.Zero) return "找不到任务栏";
+            if (tray == IntPtr.Zero) return L.T("找不到任务栏", "Taskbar not found.");
             GetWindowThreadProcessId(tray, out uint explorer);
             var tap = FindTap(explorer);
             if (tap == IntPtr.Zero)
             {
                 if (style == Normal) return null; // 从没载入过：本来就是原样
-                if (!Supported) return $"这个 Windows 版本（{Build}）还没适配，为了安全不动任务栏。";
+                if (!Supported) return L.T($"这个 Windows 版本（{Build}）还没适配，为了安全不动任务栏。", $"This Windows version ({Build}) isn't supported yet, so the taskbar is left alone for safety.");
                 if (Inject(explorer) is { } error) return error;
                 for (int i = 0; i < 40 && (tap = FindTap(explorer)) == IntPtr.Zero; i++) Thread.Sleep(100);
-                if (tap == IntPtr.Zero) return "任务栏没有响应，换个时间再试试。";
+                if (tap == IntPtr.Zero) return L.T("任务栏没有响应，换个时间再试试。", "The taskbar didn't respond. Try again later.");
             }
             if (style != Normal)
             {
                 // 刚载入时还在一层层找背景；找不到说明这个版本的任务栏长得不一样
                 int layers = 0;
                 for (int i = 0; i < 30 && (layers = LayerCount(tap)) == 0; i++) Thread.Sleep(100);
-                if (layers == 0) return "没找到任务栏背景（这个版本的任务栏结构不一样），已保持原样。";
+                if (layers == 0) return L.T("没找到任务栏背景（这个版本的任务栏结构不一样），已保持原样。", "Couldn't find the taskbar background (this taskbar is built differently), left as is.");
             }
             PostMessage(tap, WM_TAP_MODE, style == Normal ? IntPtr.Zero : 1, style == Normal ? IntPtr.Zero : Environment.ProcessId);
             // 背景层拿掉以后，任务栏窗口自己的底板在托盘那块和顶上 2 像素是纯黑的：
@@ -150,7 +150,7 @@ internal static class TaskbarStyle
         catch (Exception ex)
         {
             Log.Error(ex);
-            return "找不到 GlassTap.dll（应该在玻璃收纳的文件夹里）。";
+            return L.T("找不到 GlassTap.dll（应该在玻璃收纳的文件夹里）。", "GlassTap.dll not found (it should be in the GlassBox folder).");
         }
         try
         {
@@ -163,15 +163,15 @@ internal static class TaskbarStyle
             if (!helper.WaitForExit(15000))
             {
                 helper.Kill();
-                return "载入超时。";
+                return L.T("载入超时。", "Loading timed out.");
             }
             int hr = helper.ExitCode;
-            return hr == 0 ? null : $"载入失败（0x{hr:X8}）。";
+            return hr == 0 ? null : L.T($"载入失败（0x{hr:X8}）。", $"Loading failed (0x{hr:X8}).");
         }
         catch (Exception ex)
         {
             Log.Error(ex);
-            return "载入失败：" + ex.Message;
+            return L.T("载入失败：", "Loading failed: ") + ex.Message;
         }
     }
 
@@ -201,7 +201,13 @@ internal static class TaskbarStyle
         string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GlassBox", "tap");
         Directory.CreateDirectory(dir);
         string target = Path.Combine(dir, $"GlassTap-{hash}.dll");
+        // 已经有一份的话核对整份内容：这个文件夹谁都能写，被换掉的 DLL 会被 explorer 载入，宁可不载
         if (!File.Exists(target)) File.WriteAllBytes(target, bytes);
+        else if (!SHA256.HashData(File.ReadAllBytes(target)).AsSpan().SequenceEqual(SHA256.HashData(bytes)))
+        {
+            File.WriteAllBytes(target, bytes); // 被占着写不进去会抛异常，上面就报“载入失败”，不会用到坏的那份
+            if (!SHA256.HashData(File.ReadAllBytes(target)).AsSpan().SequenceEqual(SHA256.HashData(bytes))) throw new IOException("GlassTap.dll 对不上");
+        }
         foreach (var old in Directory.GetFiles(dir, "GlassTap-*.dll"))
             if (!old.Equals(target, StringComparison.OrdinalIgnoreCase))
                 try { File.Delete(old); } catch { } // 还被旧的 explorer 占着就下次再删

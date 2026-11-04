@@ -13,8 +13,8 @@ internal static class Uninstaller
     public static int Run()
     {
         var answer = MessageBox.Show(
-            "卸载玻璃收纳？\n\n会还原桌面图标和任务栏、关掉开机自动启动。\n你的文件一个都不会动。",
-            "玻璃收纳", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+            L.T("卸载玻璃收纳？\n\n会还原桌面图标和任务栏、关掉开机自动启动。\n你的文件一个都不会动。", "Uninstall GlassBox?\n\nThis restores your desktop icons and taskbar and turns off start with Windows.\nNone of your files will be touched."),
+            L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
         if (answer != DialogResult.OK) return 1;
 
         StopRunning();
@@ -26,8 +26,8 @@ internal static class Uninstaller
         catch (Exception ex) { Log.Error(ex); }
 
         bool wipe = MessageBox.Show(
-            "同时删除玻璃收纳的设置和缓存吗？\n\n（分类、顺序、常用记录、歌词缓存。选“否”会留着，以后重新打开还能接着用）",
-            "玻璃收纳", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
+            L.T("同时删除玻璃收纳的设置和缓存吗？\n\n（分类、顺序、常用记录、歌词缓存。选“否”会留着，以后重新打开还能接着用）", "Also delete GlassBox's settings and cache?\n\n(Categories, order, usage history, lyrics cache. Choose No to keep them for next time.)"),
+            L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
         if (wipe)
         {
             foreach (var dir in new[]
@@ -41,7 +41,7 @@ internal static class Uninstaller
             }
         }
 
-        MessageBox.Show("已经卸载好了。\n\n现在可以直接删除玻璃收纳所在的文件夹。", "玻璃收纳", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        MessageBox.Show(L.T("已经卸载好了。\n\n现在可以直接删除玻璃收纳所在的文件夹。", "Uninstalled.\n\nYou can now delete the GlassBox folder."), L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OK, MessageBoxIcon.Information);
         return 0;
     }
 

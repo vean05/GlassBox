@@ -289,10 +289,10 @@ internal static class InputDialog
         form.ClientSize = new Size(320, 92);
         box.SetBounds(12, 14, 296, 26);
         box.Text = initial;
-        ok.Text = "确定";
+        ok.Text = L.T("确定", "OK");
         ok.DialogResult = DialogResult.OK;
         ok.SetBounds(148, 52, 76, 28);
-        cancel.Text = "取消";
+        cancel.Text = L.T("取消", "Cancel");
         cancel.DialogResult = DialogResult.Cancel;
         cancel.SetBounds(232, 52, 76, 28);
         form.Controls.AddRange(new Control[] { box, ok, cancel });

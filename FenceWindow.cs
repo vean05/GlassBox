@@ -442,7 +442,7 @@ internal sealed class FenceWindow : Form
         if (Items.Count == 0)
         {
             using var sub = new SolidBrush(t.SubText);
-            g.DrawString(dropIndex >= 0 ? "松开放入这个盒子" : "拖放文件到这里", labelFont, sub, content, CenterFormat);
+            g.DrawString(dropIndex >= 0 ? L.T("松开放入这个盒子", "Release to drop into this box") : L.T("拖放文件到这里", "Drop files here"), labelFont, sub, content, CenterFormat);
             return;
         }
 
@@ -745,13 +745,13 @@ internal sealed class FenceWindow : Form
         {
             e.Effect = DragDropEffects.Move;
             e.DropImageType = DropImageType.Move;
-            e.Message = "移到 %1";
+            e.Message = L.T("移到 %1", "Move to %1");
         }
         else if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
         {
             e.Effect = DragDropEffects.Link;
             e.DropImageType = DropImageType.Link;
-            e.Message = "收纳到 %1";
+            e.Message = L.T("收纳到 %1", "File into %1");
         }
         else
         {

@@ -1,10 +1,11 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace GlassBox;
 
 /// <summary>
-/// 系统的音频（Core Audio）：读当前输出设备的音量峰值给胶囊的音柱跳；读/改某个程序自己的音量（音量合成器里那一条）。
+/// 系统的音频（Core Audio）：读当前输出设备的音量峰值给胶囊的音柱跳；读/改某个程序自己的音量（音量合成器里那一条）；
+/// 现在从哪个设备出声、换到别的设备。
 /// 跟 Media.cs 一样直接按虚表调用，不引用额外的库。只在界面线程上、要用时才调，平时什么都不做。
 /// </summary>
 internal static unsafe class Audio
@@ -150,13 +151,7 @@ internal static unsafe class Audio
     /// <summary>在默认输出设备上取一个接口。</summary>
     static IntPtr Activate(Guid iid)
     {
-        if (enumerator == IntPtr.Zero)
-        {
-            var clsid = CLSID_MMDeviceEnumerator;
-            var eid = IID_IMMDeviceEnumerator;
-            if (CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_ALL, ref eid, out enumerator) < 0) enumerator = IntPtr.Zero;
-            if (enumerator == IntPtr.Zero) return IntPtr.Zero;
-        }
+        if (!EnsureEnumerator()) return IntPtr.Zero;
         IntPtr device = IntPtr.Zero, result = IntPtr.Zero;
         if (((delegate* unmanaged<IntPtr, int, int, IntPtr*, int>)Slot(enumerator, EnumeratorGetDefault))(enumerator, eRender, eMultimedia, &device) < 0 || device == IntPtr.Zero)
             return IntPtr.Zero; // 没有输出设备
@@ -168,6 +163,147 @@ internal static unsafe class Audio
         finally { Release(ref device); }
     }
 
+    // ---------- 输出设备：现在从哪里出声、换到哪里 ----------
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROPERTYKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    struct PROPVARIANT
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr ptr;
+        [FieldOffset(8)] public uint uintVal;
+    }
+
+    const int EnumeratorEnumEndpoints = 3, DeviceOpenPropertyStore = 4, DeviceGetId = 5;
+    const int CollectionGetCount = 3, CollectionItem = 4, StoreGetValue = 5;
+    const int DEVICE_STATE_ACTIVE = 1, STGM_READ = 0, VT_LPWSTR = 31, VT_UI4 = 19;
+    const uint FormFactorHeadphones = 3, FormFactorHeadset = 5;
+    static readonly PROPERTYKEY FriendlyNameKey = new() { fmtid = new("A45C254E-DF1C-4EFD-8020-67D146A850E0"), pid = 14 };
+    static readonly PROPERTYKEY FormFactorKey = new() { fmtid = new("1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E"), pid = 0 };
+    // 设置默认设备没有公开的接口，“声音”设置和所有切换小工具用的都是这个（Windows 7 到 11 一直在）
+    static readonly Guid CLSID_PolicyConfig = new("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9");
+    static readonly Guid IID_IPolicyConfig = new("F8679F50-850A-41CF-9C72-430F290290C8");
+    const int PolicySetDefaultEndpoint = 13;
+
+    /// <summary>一个输出设备：系统里的 id、名字（“耳机 (WH-1000XM5)”）、是不是耳机。</summary>
+    public readonly record struct Output(string Id, string Name, bool Headphones);
+
+    /// <summary>现在默认的输出设备（声音从这里出来）。没有就是 null。</summary>
+    public static Output? DefaultOutput()
+    {
+        try
+        {
+            if (!EnsureEnumerator()) return null;
+            IntPtr device = IntPtr.Zero;
+            if (((delegate* unmanaged<IntPtr, int, int, IntPtr*, int>)Slot(enumerator, EnumeratorGetDefault))(enumerator, eRender, eMultimedia, &device) < 0 || device == IntPtr.Zero) return null;
+            try { return Describe(device); }
+            finally { Release(ref device); }
+        }
+        catch (Exception) { return null; }
+    }
+
+    /// <summary>所有能用的输出设备（插着的、连着的）。</summary>
+    public static List<Output> Outputs()
+    {
+        var list = new List<Output>();
+        try
+        {
+            if (!EnsureEnumerator()) return list;
+            IntPtr collection = IntPtr.Zero;
+            if (((delegate* unmanaged<IntPtr, int, int, IntPtr*, int>)Slot(enumerator, EnumeratorEnumEndpoints))(enumerator, eRender, DEVICE_STATE_ACTIVE, &collection) < 0 || collection == IntPtr.Zero) return list;
+            try
+            {
+                uint count = 0;
+                ((delegate* unmanaged<IntPtr, uint*, int>)Slot(collection, CollectionGetCount))(collection, &count);
+                for (uint i = 0; i < count; i++)
+                {
+                    IntPtr device = IntPtr.Zero;
+                    if (((delegate* unmanaged<IntPtr, uint, IntPtr*, int>)Slot(collection, CollectionItem))(collection, i, &device) < 0 || device == IntPtr.Zero) continue;
+                    try { if (Describe(device) is { } output) list.Add(output); }
+                    finally { Release(ref device); }
+                }
+            }
+            finally { Release(ref collection); }
+        }
+        catch (Exception) { }
+        return list;
+    }
+
+    /// <summary>
+    /// 把声音换到这个设备（跟在 Windows“声音”设置里选输出设备一样，三种用途一起换）。
+    /// 只在用户自己点了的时候调。
+    /// </summary>
+    public static bool SetDefaultOutput(string id)
+    {
+        IntPtr policy = IntPtr.Zero, text = IntPtr.Zero;
+        try
+        {
+            var clsid = CLSID_PolicyConfig;
+            var iid = IID_IPolicyConfig;
+            if (CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_ALL, ref iid, out policy) < 0 || policy == IntPtr.Zero) return false;
+            text = Marshal.StringToCoTaskMemUni(id);
+            bool ok = true;
+            for (int role = 0; role < 3; role++) // 控制台、多媒体、通讯
+                ok &= ((delegate* unmanaged<IntPtr, IntPtr, int, int>)Slot(policy, PolicySetDefaultEndpoint))(policy, text, role) >= 0;
+            Release(ref meter); // 音柱跟着换过去
+            return ok;
+        }
+        catch (Exception) { return false; }
+        finally
+        {
+            if (text != IntPtr.Zero) Marshal.FreeCoTaskMem(text);
+            Release(ref policy);
+        }
+    }
+
+    static Output? Describe(IntPtr device)
+    {
+        IntPtr idText = IntPtr.Zero, store = IntPtr.Zero;
+        try
+        {
+            if (((delegate* unmanaged<IntPtr, IntPtr*, int>)Slot(device, DeviceGetId))(device, &idText) < 0 || idText == IntPtr.Zero) return null;
+            string id = Marshal.PtrToStringUni(idText) ?? "";
+            if (((delegate* unmanaged<IntPtr, int, IntPtr*, int>)Slot(device, DeviceOpenPropertyStore))(device, STGM_READ, &store) < 0 || store == IntPtr.Zero) return new Output(id, L.T("输出设备", "Output device"), false);
+            string name = L.T("输出设备", "Output device");
+            bool headphones = false;
+            var key = FriendlyNameKey;
+            PROPVARIANT value = default;
+            if (((delegate* unmanaged<IntPtr, PROPERTYKEY*, PROPVARIANT*, int>)Slot(store, StoreGetValue))(store, &key, &value) >= 0)
+            {
+                if (value.vt == VT_LPWSTR && value.ptr != IntPtr.Zero) name = Marshal.PtrToStringUni(value.ptr) ?? name;
+                PropVariantClear(ref value);
+            }
+            key = FormFactorKey;
+            value = default;
+            if (((delegate* unmanaged<IntPtr, PROPERTYKEY*, PROPVARIANT*, int>)Slot(store, StoreGetValue))(store, &key, &value) >= 0)
+            {
+                headphones = value.vt == VT_UI4 && value.uintVal is FormFactorHeadphones or FormFactorHeadset;
+                PropVariantClear(ref value);
+            }
+            return new Output(id, name, headphones);
+        }
+        finally
+        {
+            if (idText != IntPtr.Zero) Marshal.FreeCoTaskMem(idText);
+            Release(ref store);
+        }
+    }
+
+    static bool EnsureEnumerator()
+    {
+        if (enumerator != IntPtr.Zero) return true;
+        var clsid = CLSID_MMDeviceEnumerator;
+        var eid = IID_IMMDeviceEnumerator;
+        if (CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_ALL, ref eid, out enumerator) < 0) enumerator = IntPtr.Zero;
+        return enumerator != IntPtr.Zero;
+    }
+
     static IntPtr Slot(IntPtr obj, int index) => (*(IntPtr**)obj)[index];
 
     static void Release(ref IntPtr ptr)
@@ -177,4 +313,5 @@ internal static unsafe class Audio
     }
 
     [DllImport("ole32.dll")] static extern int CoCreateInstance(ref Guid clsid, IntPtr outer, int context, ref Guid iid, out IntPtr obj);
+    [DllImport("ole32.dll")] static extern int PropVariantClear(ref PROPVARIANT value);
 }

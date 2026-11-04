@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_name__",
+  "short_name": "__MSG_short__",
+  "version": "1.6.0",
+  "default_locale": "zh_CN",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1Qh5CA5UKo5RqzvUgbF3fkB5usfp+Sbzafx8qz2SSku+DKtU/26A42ZPCFBqpacA+p1wVzJGRBFtSDTrOufhnJuHMYpB378OHP+EAgkybOEv/IdsircyztjryPmSY3Bj78abWozrpkU08yKh9z3qQHcOJ4xt4yJWCsuwWi9fBlzr98fNwBpNJHolyNsA9iklZjG1QDwfv1m4ATrDU2wWboMHVhoR7AzH9nvoAT2kUSkbGmTximAe446p8P8RTOp6iVw5VWTkjk4VNtp4KGRO4hw/KVWljRZwlqik8+DCVotsI++5yLT5QS30KaZe/ni1rO5aS4BjkeJ0z2yPOgCdoQIDAQAB",
+  "description": "__MSG_desc__",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "http://127.0.0.1:48613/*",
+    "https://www.youtube.com/*",
+    "https://m.youtube.com/*",
+    "https://music.youtube.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*",
+        "https://music.youtube.com/*"
+      ],
+      "js": [
+        "youtube.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "debugger"
+  ]
+}

@@ -14,6 +14,8 @@ internal static class Program
         if (args.Contains("--uninstall"))
         {
             ApplicationConfiguration.Initialize();
+            string? language = ConfigStore.Load()?.Language;
+            L.Use(string.IsNullOrEmpty(language) ? "zh" : language);
             return Uninstaller.Run();
         }
 

@@ -16,7 +16,7 @@ namespace GlassBox;
 internal sealed class CapsuleWindow : Form
 {
     enum Mode { Idle, Open, Receive, Notify, Music }
-    enum Seg { Dot, Text, Bold, Muted, Sep, Chip, Bar, Note, Wave }
+    enum Seg { Dot, Text, Bold, Muted, Sep, Chip, Bar, Note, Wave, Battery, Ring, Count, Lyric }
     enum Pending { None, Open, Close, EndNote }
     enum PageKind { Frequent, Downloads, Screenshots, Fence }
 
@@ -28,7 +28,8 @@ internal sealed class CapsuleWindow : Form
     // 尺寸都按 96 DPI 写，画的时候乘 S
     const float Rim = 30;      // 胶囊四周留给阴影和涟漪的边
     const float CellW = 92, CellH = 104, PanelChrome = 150;
-    const int FrequentMax = 24;
+    const int FrequentRows = 5;
+    int FrequentMax => FrequentRows * Columns(OpenW);
 
     static readonly StringFormat Tight = new(StringFormat.GenericTypographic)
     {
@@ -104,6 +105,7 @@ internal sealed class CapsuleWindow : Form
     readonly HashSet<string> trashing = new(StringComparer.OrdinalIgnoreCase); // 不显示的：等着丢的 + 刚丢完、等重新扫描的
     readonly List<string> trashQueue = new();
     readonly System.Windows.Forms.Timer trashTimer = new() { Interval = 5000 };
+    readonly System.Windows.Forms.Timer mediaGap = new() { Interval = 4000 }; // 切歌时播放器短暂报“没在放”：等这么久还是没有才收起
     DesktopItem? trashItem;
     FenceConfig? trashFence;
     PageKind? trashPage;
@@ -199,6 +201,73 @@ internal sealed class CapsuleWindow : Form
     (string Title, string Artist) pretty;
     readonly Dictionary<(string, Font, int), string> fitCache = new();
 
+    // 锁住音乐卡片：鼠标走开也不收起（去看一眼文件面板，收起时也回到音乐卡片）。
+    // 双击卡片、点右上角的小锁、或者放歌时连按两下 Ctrl（开了的话）；锁着时卡片边上有一圈慢慢呼吸的光
+    bool musicPinned, musicRaised;
+    long lastCardClick = -1;
+    Point lastCardClickAt;
+    RectangleF lockRect;
+    float drift; // 只在放歌时往前走的时钟（秒）：背景漂、锁住的光呼吸，暂停时停在原地不跳
+
+    // 在卡片上滚滚轮调音量：封面上浮出一个大数字和一圈进度
+    long volumeShownSince = -1;
+    const int VolumeShowMs = 1100;
+    Font volumeFont = null!;
+
+    // 现在从哪个设备出声（耳机还是音箱），和读音量一起两秒读一次
+    Audio.Output? output;
+    // 模糊封面背景：卡片和桌面小播放器各一张（大小不一样）
+    readonly Backdrop cardBackdrop = new(), floatBackdrop = new();
+    // 画在自己的深色背景上时（模糊封面、桌面小播放器）：字一律用白的
+    bool lightInk;
+    bool DarkInk => app.Tone.DarkInk && !lightInk;
+
+    // 拖出来的小播放器：在卡片空白处按住往下拖
+    MusicFloat? floatWin;
+    bool cardPressed, detaching;
+    Point cardPressAt, detachGrab;
+    readonly List<(RectangleF Rect, string Key, int Value)> floatHits = new();
+
+    // YouTube 广告：“跳过”按钮出来时胶囊上提示，点一下就跳
+    AdSkipper? ads;   // 老办法：从外面读网页（YouTube 要是当前标签页、窗口没最小化）
+    AdBridge? adBridge; // 自带的 Edge 扩展来报（后台标签页也行）
+    bool adBridgeFailed, adFromUia, adFromExt, adOutdatedShown;
+    bool adSkippable, adNote, adNoteChip;
+    string adNoteText = "";
+
+    // 蓝牙耳机电量：卡片开着时一分钟读一次（后台线程，读系统里已有的值）
+    List<(string Name, int Percent)> btLevels = new();
+    long btRead = -100000;
+    bool btReading;
+
+    // 歌词：每句的字形（按字号缓存，换句的那几帧字号在变才现做）
+    readonly Dictionary<(int Line, int Size, int Width), GraphicsPath> lyricPaths = new();
+    SongLyrics? lyricPathsFor;
+    int lyricRollFrom = -1;
+
+    // 收起时滚歌词：当前那句，换句时旧的往上退、新的从下面浮上来
+    int pillLyricIndex = -1;
+    string pillLyric = "", pillLyricPrev = "";
+    long pillLyricSince = -1;
+
+    // 充电：插上充电器那一下，电池一格格涨上去、一道绿光从左扫到右
+    PowerLineStatus lastPower = SystemInformation.PowerStatus.PowerLineStatus;
+    bool chargeNote;
+    float chargePercent;
+    long chargeSince = -1;
+    const int ChargeMs = 1500;
+
+    // 番茄钟：专注 N 分钟 → 休息 5 分钟。专注时胶囊只显示倒计时，提示先攒着，唱片和音柱停下来
+    readonly System.Windows.Forms.Timer focusTick = new() { Interval = 1000 };
+    DateTime? focusEnd; // UTC
+    TimeSpan focusLength;
+    bool focusBreak;
+    int focusMissed;
+    RectangleF focusRect;
+    const int BreakMinutes = 5;
+    /// <summary>正在专注（不算休息）：安静模式。</summary>
+    bool Focusing => focusEnd != null && !focusBreak;
+
     public CapsuleWindow(GlassBoxApp app)
     {
         this.app = app;
@@ -207,7 +276,7 @@ internal sealed class CapsuleWindow : Form
         StartPosition = FormStartPosition.Manual;
         AutoScaleMode = AutoScaleMode.None;
         AllowDrop = true;
-        Text = "玻璃收纳";
+        Text = L.T("玻璃收纳", "GlassBox");
         var area = Screen.PrimaryScreen!.WorkingArea;
         Bounds = new Rectangle(area.Left + area.Width / 2 - 150, area.Top, 300, 100); // 先放到主屏上，DPI 才按主屏算
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.Opaque, true);
@@ -221,12 +290,19 @@ internal sealed class CapsuleWindow : Form
             if (chipPressed && !chipScrolling && chipPress >= FixedPages && chipLift < 0 && mode == Mode.Open) BeginChipLift(PointToClient(Cursor.Position).X);
         };
         trashTimer.Tick += (_, _) => CommitTrash();
+        mediaGap.Tick += (_, _) =>
+        {
+            mediaGap.Stop();
+            SetMedia(app.Media?.Current, settled: true);
+        };
+        focusTick.Tick += (_, _) => OnFocusTick();
         caret.Tick += (_, _) => { caretOn = !caretOn; Redraw(); };
         trim.Tick += (_, _) =>
         {
             trim.Stop();
             if (mode != Mode.Idle || Animating) return;
             surface.Trim(); // 展开时的大画布用完就还
+            cardBackdrop.Clear(); // 模糊封面背景也是（几 MB），下次打开卡片再做
             GlassBoxApp.TrimMemory();
         };
         media = app.Media?.Current;
@@ -308,16 +384,38 @@ internal sealed class CapsuleWindow : Form
     }
 
     /// <summary>“下载”文件夹里有东西下载完了。</summary>
-    public void ShowDownloaded(DesktopItem item) => Notify(item, null, "下载完成", PageKind.Downloads);
+    public void ShowDownloaded(DesktopItem item) => Notify(item, null, L.T("下载完成", "Downloaded"), PageKind.Downloads);
 
     /// <summary>刚截了一张图（进了「图像」页）。</summary>
-    public void ShowScreenshot(DesktopItem item) => Notify(item, null, "截图已收进", PageKind.Screenshots);
+    public void ShowScreenshot(DesktopItem item)
+    {
+        // 开了“截图飞进胶囊”：先定格、飞进来，到了胶囊“咽”一下再提示
+        if (app.Config.ShotFly && animate && !Focusing && Visible && IsHandleCreated && !fullscreenBusy && mode is not (Mode.Open or Mode.Music))
+        {
+            ShotFlight.Launch(this, item.Path, () => capsuleOnScreen, () =>
+            {
+                sh.V -= 120;
+                sw.V += 90;
+                Notify(item, null, L.T("截图已收进", "Screenshot saved"), PageKind.Screenshots);
+                Kick();
+            }, () => Notify(item, null, L.T("截图已收进", "Screenshot saved"), PageKind.Screenshots));
+            return;
+        }
+        Notify(item, null, L.T("截图已收进", "Screenshot saved"), PageKind.Screenshots);
+    }
 
-    void Notify(DesktopItem item, FenceConfig? fence, string lead, PageKind? page)
+    /// <param name="urgent">用户自己刚做的事（比如丢进回收站后的“撤销”）：专注时也要显示。</param>
+    void Notify(DesktopItem item, FenceConfig? fence, string lead, PageKind? page, bool urgent = false)
     {
         freshPath = item.Path;
         freshSince = Now;
         if (mode == Mode.Music) return; // 正在看音乐卡片：不打断，展开面板时这个文件会亮一下
+        if (Focusing && !urgent && mode != Mode.Open)
+        {
+            focusMissed++; // 专注时不弹：结束时一起告诉你收进了几个
+            return;
+        }
+        chargeNote = adNote = false;
         if (mode == Mode.Open)
         {
             if (query.Length == 0) tab = Math.Max(0, page is { } kind ? IndexOfKind(kind) : IndexOfFence(fence));
@@ -334,12 +432,22 @@ internal sealed class CapsuleWindow : Form
         downloadName = null;
         SetMode(Mode.Notify);
         ripple = Now;
-        Schedule(Pending.EndNote, lead.StartsWith("下载") ? 4200 : 2800);
+        Schedule(Pending.EndNote, lead.StartsWith(L.T("下载", "Download")) ? 4200 : 2800);
     }
 
     /// <summary>正在播放的东西变了（null = 什么都没在放）。</summary>
-    public void SetMedia(NowPlaying? next)
+    public void SetMedia(NowPlaying? next) => SetMedia(next, settled: false);
+
+    void SetMedia(NowPlaying? next, bool settled)
     {
+        // 连按下一首时，播放器在两首歌之间常常有一下报“什么都没放”（新歌名还没出来）。
+        // 卡片开着、锁着或者在桌面上时先别收：原样留着等一会儿，下一首来了直接换上；过了几秒还是没有才算真的停了。
+        if (next == null && !settled && media != null && (mode == Mode.Music || musicPinned || floatWin != null))
+        {
+            if (!mediaGap.Enabled) mediaGap.Start();
+            return;
+        }
+        mediaGap.Stop();
         var old = media;
         media = next;
         if (old?.Art != null && old.Art != next?.Art) old.Art.Dispose(); // 封面换了，旧的这边负责释放
@@ -347,13 +455,20 @@ internal sealed class CapsuleWindow : Form
         if (old?.Source != next?.Source) volumeRead = 0; // 换了程序：音量重新读
         UpdateAccent(next);
         BuildPill();
+        if (next == null) musicPinned = false; // 什么都不放了：锁住也一起取消
+        if (next == null || !next.Playing || !IsBrowser(next.Source)) adFromUia = false; // 扩展报的不看这里：广告可能在别的标签页
+        adSkippable = (adFromUia || adFromExt) && app.Config.SkipAds;
         if (mode == Mode.Music)
         {
             if (next == null) Collapse();
             else EnsureLyrics();
         }
+        else if (next != null && (app.Config.PillLyrics || floatWin != null)) EnsureLyrics(); // 收起时也要滚歌词、桌面上有小播放器：换歌就去找
+        UpdateFloat();
         Redraw();
     }
+
+    static bool IsBrowser(string source) => source.Contains("msedge", StringComparison.OrdinalIgnoreCase) || source.Contains("chrome", StringComparison.OrdinalIgnoreCase);
 
     void UpdateAccent(NowPlaying? np)
     {
@@ -468,6 +583,22 @@ internal sealed class CapsuleWindow : Form
     public void Summon()
     {
         if (!Visible || !IsHandleCreated) return;
+        // 开了“放歌时连按两下 Ctrl 锁住卡片”：打开音乐卡片并锁住，浮到所有窗口上面；再按一次解开、收起
+        if (app.Config.CtrlLocksMusic && media != null && app.Config.ShowNowPlaying && floatWin == null && mode != Mode.Open)
+        {
+            if (mode == Mode.Music && musicPinned)
+            {
+                musicPinned = false;
+                Collapse();
+                return;
+            }
+            ShowMusic();
+            musicPinned = true;
+            ripple = Now;
+            musicRaised = true;
+            SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            return;
+        }
         if (mode == Mode.Open && summoned)
         {
             Collapse();
@@ -512,6 +643,7 @@ internal sealed class CapsuleWindow : Form
     {
         if (!Visible || !IsHandleCreated || media == null) return;
         Cancel();
+        CloseFloat(); // 拖出来放在桌面上的：收回胶囊里
         revealed = true;
         musicHoldUntil = Now + 8000;
         SendToBottom();
@@ -526,6 +658,7 @@ internal sealed class CapsuleWindow : Form
         downloadName = name;
         if (name != null)
         {
+            if (Focusing && mode == Mode.Idle) return; // 专注时不弹下载进度
             if (mode is Mode.Idle or Mode.Notify)
             {
                 if (pending == Pending.EndNote) Cancel();
@@ -553,6 +686,7 @@ internal sealed class CapsuleWindow : Form
         {
             notePath = null;
             noteFence = null;
+            chargeNote = adNote = false;
             dropFiles = Array.Empty<string>();
             trim.Stop();
             trim.Start();
@@ -643,11 +777,17 @@ internal sealed class CapsuleWindow : Form
     void Collapse()
     {
         if (mode is not (Mode.Open or Mode.Music)) return;
+        if (musicPinned && media != null)
+        {
+            // 锁住了：从文件面板收起时回到音乐卡片，音乐卡片本身不收
+            if (mode == Mode.Open) SetMode(Mode.Music);
+            return;
+        }
         SetMode(downloadName != null ? Mode.Notify : Mode.Idle);
         // 刚丢的还能撤销：收起后胶囊上留着“已丢进回收站 · 撤销”，到点就消失
         if (mode == Mode.Idle && CanUndoTrash && Now < trashToastUntil)
         {
-            Notify(trashItem!, trashFence, "已丢进回收站", trashFence == null ? trashPage : null);
+            Notify(trashItem!, trashFence, L.T("已丢进回收站", "Moved to Recycle Bin"), trashFence == null ? trashPage : null, urgent: true);
             noteUndo = true;
             BuildPill();
             Schedule(Pending.EndNote, (int)Math.Max(300, trashToastUntil - Now));
@@ -681,7 +821,8 @@ internal sealed class CapsuleWindow : Form
                 Collapse();
                 break;
             case Pending.EndNote when mode == Mode.Notify:
-                if (downloadName != null)
+                chargeNote = adNote = false;
+                if (downloadName != null && !Focusing)
                 {
                     notePath = null;
                     BuildPill();
@@ -690,6 +831,224 @@ internal sealed class CapsuleWindow : Form
                 else SetMode(Mode.Idle);
                 break;
         }
+    }
+
+    // ---------- 充电、番茄钟、收起时的歌词、天色光 ----------
+
+    /// <summary>电源状态变了（插拔电源、电量变化都会来）：只在刚插上充电器那一下亮一下。</summary>
+    void OnPowerChanged()
+    {
+        var status = SystemInformation.PowerStatus;
+        var line = status.PowerLineStatus;
+        bool plugged = line == PowerLineStatus.Online && lastPower == PowerLineStatus.Offline;
+        lastPower = line;
+        if (!plugged || !app.Config.ChargeEffect || Focusing || !Visible) return;
+        if (status.BatteryChargeStatus.HasFlag(BatteryChargeStatus.NoSystemBattery) || status.BatteryLifePercent is < 0 or > 1) return;
+        if (mode is Mode.Open or Mode.Music || mode == Mode.Notify && !chargeNote) return; // 正在用、正在提示别的：不打断
+        chargePercent = status.BatteryLifePercent;
+        chargeSince = Now;
+        chargeNote = true;
+        adNote = false;
+        noteUndo = false;
+        notePath = null;
+        noteFence = null;
+        notePage = null;
+        SetMode(Mode.Notify);
+        Schedule(Pending.EndNote, 3200);
+    }
+
+    void ToggleFocus()
+    {
+        if (focusEnd != null) StopFocus();
+        else StartFocus(TimeSpan.FromMinutes(app.Config.FocusMinutes is 15 or 25 or 45 or 60 ? app.Config.FocusMinutes : 25), rest: false);
+    }
+
+    void StartFocus(TimeSpan length, bool rest)
+    {
+        focusLength = length;
+        focusEnd = DateTime.UtcNow + length;
+        focusBreak = rest;
+        if (!rest) focusMissed = 0;
+        focusTick.Start();
+        if (!rest && mode == Mode.Notify && !noteUndo) SetMode(Mode.Idle); // 开始专注：正在弹的提示收掉
+        BuildPill();
+        Redraw();
+    }
+
+    void StopFocus()
+    {
+        focusEnd = null;
+        focusBreak = false;
+        focusTick.Stop();
+        BuildPill();
+        Redraw();
+    }
+
+    TimeSpan FocusLeft => focusEnd is { } end ? end - DateTime.UtcNow : TimeSpan.Zero;
+
+    /// <summary>每秒一下：倒计时走一格；到点了就换成休息，休息完就结束。</summary>
+    void OnFocusTick()
+    {
+        if (focusEnd == null)
+        {
+            focusTick.Stop();
+            return;
+        }
+        if (FocusLeft > TimeSpan.Zero)
+        {
+            BuildPill();
+            if (mode is Mode.Idle or Mode.Open) Redraw();
+            return;
+        }
+        System.Media.SystemSounds.Asterisk.Play(); // 跟着系统的提示音和音量
+        if (!focusBreak)
+        {
+            int missed = focusMissed;
+            StartFocus(TimeSpan.FromMinutes(BreakMinutes), rest: true);
+            FocusNote(L.T("专注完成", "Focus done"), missed > 0 ? L.T($"休息 {BreakMinutes} 分钟 · 期间收进 {missed} 个文件", $"{BreakMinutes} min break · {missed} files came in") : L.T($"休息 {BreakMinutes} 分钟", $"Take a {BreakMinutes} min break"));
+        }
+        else
+        {
+            StopFocus();
+            FocusNote(L.T("休息结束", "Break over"), L.T("可以开始下一轮了", "Ready for the next round"));
+        }
+    }
+
+    void FocusNote(string lead, string text)
+    {
+        if (mode is Mode.Open or Mode.Music) return; // 正在用：面板上的倒计时已经变了
+        noteLead = lead;
+        noteName = text;
+        noteUndo = chargeNote = false;
+        notePath = null;
+        noteFence = null;
+        notePage = null;
+        SetMode(Mode.Notify);
+        ripple = Now;
+        Schedule(Pending.EndNote, 4200);
+    }
+
+    /// <summary>收起时要滚的那句歌词；没开、没找到、间奏里没有词时返回 null（胶囊照常显示歌名）。</summary>
+    string? PillLyricLine()
+    {
+        if (!app.Config.PillLyrics || !app.Config.Lyrics || media is not { Playing: true } np || lyrics is not { Instrumental: false } found) return null;
+        if (lyricsKey != np.Title + "\n" + np.Artist) return null;
+        int index = found.IndexAt(np.CurrentPosition + TimeSpan.FromMilliseconds(250)); // 跟卡片里一样早一点点换
+        string text = index >= 0 ? found.Lines[index].Text.Trim() : "";
+        pillLyricIndex = index;
+        return text.Length > 0 ? text : null;
+    }
+
+    /// <summary>OnWatch 里每次看一眼：唱到下一句了就重排胶囊上的字（四分之一秒一次，只比个下标）。</summary>
+    void CheckPillLyric()
+    {
+        if (mode != Mode.Idle || !app.Config.PillLyrics || lyrics == null || media is not { Playing: true } np) return;
+        if (lyrics.IndexAt(np.CurrentPosition + TimeSpan.FromMilliseconds(250)) != pillLyricIndex) BuildPill();
+    }
+
+    // 天色光的关键帧：时刻、天空的颜色、光有多浓
+    static readonly (float Hour, Color Color, float Strength)[] SkyKeys =
+    {
+        (0, Color.FromArgb(80, 95, 235), .30f),
+        (5, Color.FromArgb(100, 100, 225), .28f),
+        (6, Color.FromArgb(255, 140, 175), .36f),   // 朝霞
+        (7.5f, Color.FromArgb(255, 198, 120), .32f),
+        (10, Color.FromArgb(125, 205, 255), .26f),  // 晴空
+        (15.5f, Color.FromArgb(140, 210, 255), .24f),
+        (17.5f, Color.FromArgb(255, 150, 70), .40f), // 夕阳
+        (19, Color.FromArgb(225, 90, 170), .36f),
+        (20.5f, Color.FromArgb(90, 95, 235), .32f),  // 入夜
+        (24, Color.FromArgb(80, 95, 235), .30f),
+    };
+    static readonly PointF[] Stars = { new(.10f, .30f), new(.19f, .70f), new(.27f, .24f), new(.74f, .28f), new(.82f, .68f), new(.91f, .36f) };
+
+    /// <summary>
+    /// 天色光：一团天空颜色的光，白天像太阳从胶囊左边慢慢走到右边，夜里换成月光，边上亮几颗星。
+    /// 全是静止的，颜色跟着玻璃每 5 分钟调一次色时一起变，不为它多画一帧。
+    /// </summary>
+    void DrawSky(Graphics g, RectangleF c, float a)
+    {
+        var now = DateTime.Now;
+        float hour = now.Hour + now.Minute / 60f;
+        int i = 0;
+        while (i < SkyKeys.Length - 2 && hour >= SkyKeys[i + 1].Hour) i++;
+        var (h0, c0, k0) = SkyKeys[i];
+        var (h1, c1, k1) = SkyKeys[i + 1];
+        float t = (hour - h0) / (h1 - h0);
+        var color = Mix(c0, c1, t);
+        float strength = k0 + (k1 - k0) * t;
+        bool day = hour >= 6 && hour < 18.5f;
+        float sun = day ? .1f + .8f * (hour - 6) / 12.5f : .1f + .8f * ((hour - 18.5f + 24) % 24) / 11.5f;
+        float s = S;
+        EllipseGlow(g, new PointF(c.X + c.Width * sun, c.Y + c.Height * .62f), c.Width * .5f, c.Height * 1.3f, Color.FromArgb(Byte(strength * a), color), c);
+        float stars = hour >= 21 || hour < 4.5f ? 1 : hour >= 20 ? hour - 20 : hour < 5.5f ? 5.5f - hour : 0;
+        if (stars <= 0) return;
+        using var brush = new SolidBrush(Color.FromArgb(Byte(.85f * stars * a), 255, 255, 255));
+        for (int k = 0; k < Stars.Length; k++)
+        {
+            float r = (k % 3 == 0 ? 1.6f : 1.15f) * s;
+            g.FillEllipse(brush, c.X + c.Width * Stars[k].X - r, c.Y + c.Height * Stars[k].Y - r, r * 2, r * 2);
+        }
+    }
+
+    /// <summary>胶囊上的小电池：电量从空涨到现在的样子，中间一道闪电。</summary>
+    void DrawBattery(Graphics g, float x, float cy, float a)
+    {
+        float s = S;
+        float t = chargeSince >= 0 ? Math.Clamp((Now - chargeSince) / 900f, 0, 1) : 1;
+        float fill = chargePercent * (1 - (1 - t) * (1 - t) * (1 - t));
+        var green = app.Tone.DarkInk ? Color.FromArgb(22, 163, 74) : Color.FromArgb(74, 222, 128);
+        var body = new RectangleF(x, cy - 6 * s, 21 * s, 12 * s);
+        using (var pen = new Pen(Ink(.85f * a), 1.4f * s)) using (var path = Shapes.RoundRect(body, 3 * s)) g.DrawPath(pen, path);
+        FillRound(g, new RectangleF(body.Right + 1 * s, cy - 2.5f * s, 2 * s, 5 * s), 1 * s, Ink(.85f * a));
+        var inner = RectangleF.Inflate(body, -2.2f * s, -2.2f * s);
+        FillRound(g, new RectangleF(inner.X, inner.Y, Math.Max(2 * s, inner.Width * fill), inner.Height), 1.5f * s, Color.FromArgb(Byte(a), green));
+        float bx = body.X + body.Width / 2, by = cy;
+        PointF[] bolt =
+        {
+            new(bx + 1.2f * s, by - 5 * s), new(bx - 2.6f * s, by + .6f * s), new(bx - .2f * s, by + .6f * s),
+            new(bx - 1.2f * s, by + 5 * s), new(bx + 2.6f * s, by - .6f * s), new(bx + .2f * s, by - .6f * s),
+        };
+        using var boltBrush = new SolidBrush(app.Tone.DarkInk ? Color.FromArgb(Byte(a), 255, 255, 255) : Color.FromArgb(Byte(a), 20, 40, 24));
+        g.FillPolygon(boltBrush, bolt);
+    }
+
+    /// <summary>番茄钟的小圆环：走过的那段亮起来（专注是番茄红，休息是薄荷绿）。</summary>
+    void DrawFocusRing(Graphics g, float cx, float cy, float r, float a)
+    {
+        float s = S;
+        double total = Math.Max(1, focusLength.TotalSeconds);
+        float done = (float)Math.Clamp(1 - FocusLeft.TotalSeconds / total, 0, 1);
+        var color = focusBreak ? Color.FromArgb(94, 234, 212) : Color.FromArgb(255, 112, 88);
+        using (var track = new Pen(Ink(.22f * a), 2.2f * s)) g.DrawEllipse(track, cx - r, cy - r, r * 2, r * 2);
+        if (done > 0)
+        {
+            using var pen = new Pen(Color.FromArgb(Byte(a), color), 2.4f * s) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            g.DrawArc(pen, cx - r, cy - r, r * 2, r * 2, -90, Math.Max(4, 360 * done));
+        }
+    }
+
+    /// <summary>面板上搜索框右边的计时按钮：没在计时是一个小秒表，计时中是进度环 + 还剩几分钟。</summary>
+    void DrawFocusButton(Graphics g, float a)
+    {
+        if (focusRect.IsEmpty) return;
+        float s = S;
+        bool hot = focusRect.Contains(PointToClient(Cursor.Position));
+        if (focusEnd != null || hot) FillRound(g, focusRect, 12 * s, Ink((focusEnd != null ? .16f : .12f) * a));
+        float cx = focusRect.X + focusRect.Width / 2, cy = focusRect.Y + focusRect.Height / 2;
+        if (focusEnd != null)
+        {
+            DrawFocusRing(g, cx, cy, 10.5f * s, a);
+            string minutes = Math.Max(1, (int)Math.Ceiling(FocusLeft.TotalMinutes)).ToString();
+            float w = Measure(minutes, smallFont) * s;
+            DrawTight(g, minutes, smallFont, Ink(a), cx - w / 2, cy);
+            return;
+        }
+        using var pen = new Pen(Ink(.78f * a), 1.7f * s) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        g.DrawEllipse(pen, cx - 6.5f * s, cy - 5 * s, 13 * s, 13 * s);
+        g.DrawLine(pen, cx, cy + 1.5f * s, cx, cy - 2 * s);
+        g.DrawLine(pen, cx, cy + 1.5f * s, cx + 2.6f * s, cy + 1.5f * s);
+        g.DrawLine(pen, cx - 2 * s, cy - 8.4f * s, cx + 2 * s, cy - 8.4f * s);
     }
 
     // ---------- 鼠标在哪 ----------
@@ -773,6 +1132,7 @@ internal sealed class CapsuleWindow : Form
         if (open && !uncovered) uncoveredSince = Now;
         uncovered = open;
         SampleBackdrop(force: false);
+        CheckPillLyric();
 
         switch (mode)
         {
@@ -788,7 +1148,7 @@ internal sealed class CapsuleWindow : Form
                 }
                 bool near = overDesktop && pos.X > capsuleOnScreen.Left - 36 * s && pos.X < capsuleOnScreen.Right + 36 * s
                     && pos.Y < capsuleOnScreen.Bottom + 46 * s && pos.Y > Area.Top - 40 * s;
-                if (near && pending != Pending.Open && app.Config.HoverOpen != 3)
+                if (near && pending != Pending.Open && app.Config.HoverOpen != 3 && !detaching && floatWin?.Dragging != true)
                 {
                     Schedule(Pending.Open, HoverOpenMs);
                     // 趁等的这一下先把展开用的大画布备好；背后的样子太旧就现在重拍，展开时颜色就是对的
@@ -818,8 +1178,15 @@ internal sealed class CapsuleWindow : Form
                 break;
 
             case Mode.Music:
-                if (d <= 46 * s) musicHoldUntil = 0;
-                if (d > 46 * s && !seekDrag && !volumeDrag && !menuOpen && Now >= musicHoldUntil)
+                // 鼠标到了卡片上：等着的时间不用再等了。要等卡片缩到位再算——从文件面板点进来时，
+                // 卡片还没缩完、鼠标还“在上面”，这时就取消的话，缩完鼠标落在外面马上就收了
+                if (d <= 46 * s && musicHoldUntil > 0)
+                {
+                    var settle = Target();
+                    if (Math.Abs(sw.X - settle.W) < 2 && Math.Abs(sh.X - settle.H) < 2) musicHoldUntil = 0;
+                }
+                if (app.Config.BluetoothBattery && Now - btRead > 60000) ReadBluetooth();
+                if (d > 46 * s && !seekDrag && !volumeDrag && !menuOpen && !musicPinned && Now >= musicHoldUntil)
                 {
                     if (pending != Pending.Close) Schedule(Pending.Close, CloseMs);
                 }
@@ -828,6 +1195,7 @@ internal sealed class CapsuleWindow : Form
                 if (!volumeDrag && Now - volumeRead > 2000) ReadVolume(); // 别处改了音量也跟上
                 break;
         }
+        UpdateAds();
         if (moved && d < 220 * s) dirty = true; // 高光跟着鼠标走
         if (dirty) Kick();
     }
@@ -938,6 +1306,7 @@ internal sealed class CapsuleWindow : Form
             if (ms < 30) interval = interval * .9 + ms * .1; // 刚睡醒的那一下不算
             // 高刷屏（>100Hz）上一帧要画 5–7ms，赶不上每次刷新；固定隔一次出一帧，节奏均匀比时快时慢顺
             int every = interval < 10 ? 2 : 1;
+            if (pacerHalf) every = Math.Max(every, (int)Math.Round(1000 / 30.0 / Math.Max(4, interval))); // 唱片在转：约 30 帧
             if (++skip < every) continue;
             skip = 0;
             if (Interlocked.Exchange(ref framePending, 1) == 0) PostMessage(handle, WM_FRAME, IntPtr.Zero, IntPtr.Zero);
@@ -964,7 +1333,8 @@ internal sealed class CapsuleWindow : Form
 
         long now = Now;
         bool effects = Active(pillSwap, 300) | Active(ripple, 900) | Active(freshSince, 1800) | Active(previewSince, 220) | Active(accentSince, AccentMs) | Active(settingsSince, 220) | Active(liftSince, 160) | layoutMoving
-            | Active(lyricSince, 300) | chipLift >= 0 | Active(chipLiftSince, 160) | ChipHolding;
+            | (mode == Mode.Music && Active(lyricSince, LyricRollMs)) | (mode == Mode.Music && Active(volumeShownSince, VolumeShowMs)) | chipLift >= 0 | Active(chipLiftSince, 160) | ChipHolding
+            | Active(pillLyricSince, 320) | Active(chargeSince, ChargeMs);
         effects |= TrashAnimating;
         if (trashSince >= 0 && !trashKicked && now - trashSince >= TrashFly)
         {
@@ -993,6 +1363,13 @@ internal sealed class CapsuleWindow : Form
         }
         if (moving || effects)
         {
+            pacerHalf = false;
+            frame.Stop();
+            StartPacing();
+        }
+        else if (live && TurntableShown)
+        {
+            pacerHalf = true; // 唱片在转：跟着屏幕刷新出帧，节奏均匀才顺
             frame.Stop();
             StartPacing();
         }
@@ -1058,7 +1435,7 @@ internal sealed class CapsuleWindow : Form
         UpdateLayeredWindow(Handle, IntPtr.Zero, ref dst, ref size, surface.Dc, ref src, 0, ref blend, ULW_ALPHA);
     }
 
-    Color Ink(float alpha) => app.Tone.DarkInk
+    Color Ink(float alpha) => DarkInk
         ? Color.FromArgb(Byte(alpha), 30, 24, 28)
         : Color.FromArgb(Byte(alpha), 255, 255, 255);
 
@@ -1114,13 +1491,26 @@ internal sealed class CapsuleWindow : Form
         float music = Math.Clamp((sh.X - 70) / Math.Max(1, MusicSize().H - 70), 0, 1);
         float musicAlpha = mode == Mode.Music ? music * music : musicLast && mode != Mode.Open ? Math.Max(0, music * music - .2f) : 0;
 
+        // 模糊封面背景（开了的话）：盖在玻璃上，光和字在它上面
+        var cardCover = media?.Cover ?? media?.Art;
+        bool coverBack = app.Config.MusicBackdrop && cardCover != null && musicAlpha > .01f;
+        float clock = musicAlpha > .01f ? Drift() : drift;
+        if (coverBack)
+        {
+            var (mw, mh) = MusicSize();
+            cardBackdrop.Draw(g, c, new SizeF(mw * s, mh * s), cardCover!, clock, musicAlpha);
+        }
+
         // 歌的颜色：收起时整颗胶囊透出这团光，展开后聚在底下播放器那一角
         var (accent, accentAmount) = Accent();
+        float calm = Focusing ? .45f : 1; // 专注时光都收一收
+        // 天色光：没在放歌（或歌的光淡下去）时，收起的胶囊里透出天空的颜色
+        if (app.Config.SkyGlow && pillAlpha > .01f && accentAmount < .99f) DrawSky(g, c, pillAlpha * (1 - accentAmount) * calm);
         if (accentAmount > .01f)
         {
             if (pillAlpha > .01f)
                 EllipseGlow(g, new PointF(c.X + c.Width * .28f, c.Y + c.Height * .55f), c.Width * .62f, c.Height * 1.25f,
-                    Color.FromArgb(Byte(.34f * accentAmount * pillAlpha), accent), c);
+                    Color.FromArgb(Byte(.34f * accentAmount * pillAlpha * calm), accent), c);
             if (panelAlpha > .01f && media != null)
                 EllipseGlow(g, new PointF(c.X + 40 * s, c.Bottom - 16 * s), 300 * s, 90 * s,
                     Color.FromArgb(Byte(.30f * accentAmount * panelAlpha), accent), c);
@@ -1140,9 +1530,23 @@ internal sealed class CapsuleWindow : Form
             Fill(g, c, Color.FromArgb(Byte(.16f * (1 - t)), 255, 255, 255)); // 吞下文件时亮一下
         }
 
+        // 充电：一道绿光从左扫到右
+        float charge = chargeSince >= 0 ? (Now - chargeSince) / (float)ChargeMs : 1;
+        if (charge < 1)
+        {
+            float sweep = 1 - (1 - charge) * (1 - charge);
+            var green = Color.FromArgb(Byte(.42f * MathF.Sqrt(1 - charge)), 74, 222, 128);
+            EllipseGlow(g, new PointF(c.X - 60 * s + (c.Width + 120 * s) * sweep, c.Y + c.Height / 2), 70 * s, c.Height * 1.1f, green, c);
+        }
+
         if (pillAlpha > .01f) DrawPill(g, c, pillAlpha);
         if (panelAlpha > .01f) DrawPanel(g, c, panelAlpha);
-        if (musicAlpha > .01f) DrawMusic(g, c, musicAlpha);
+        if (musicAlpha > .01f)
+        {
+            lightInk = coverBack; // 模糊封面是深色的：字用白的
+            try { DrawMusic(g, c, musicAlpha); }
+            finally { lightInk = false; }
+        }
         g.Restore(state);
 
         // 边：一圈很细的亮边，离鼠标近的地方更亮
@@ -1155,6 +1559,20 @@ internal sealed class CapsuleWindow : Form
             {
                 using var pen = new Pen(Color.FromArgb(Byte(.45f * accentAmount), Mix(accent, Color.White, .3f)), 1.2f * s);
                 g.DrawPath(pen, outline);
+            }
+            if (charge < 1)
+            {
+                using var pen = new Pen(Color.FromArgb(Byte(.7f * (1 - charge)), 134, 239, 172), 1.4f * s);
+                g.DrawPath(pen, outline);
+            }
+            if (musicPinned && musicAlpha > .01f)
+            {
+                // 锁住了：边上一圈慢慢呼吸的光（跟着歌的颜色；暂停时停在原地）
+                float pulse = .5f + .5f * MathF.Sin(clock * 2.4f);
+                var glowColor = accentAmount > .05f ? Mix(Color.White, accent, .55f * accentAmount) : Color.White;
+                using (var wide = new Pen(Color.FromArgb(Byte((.08f + .12f * pulse) * musicAlpha), glowColor), 6 * s)) g.DrawPath(wide, outline);
+                using var thin = new Pen(Color.FromArgb(Byte((.45f + .35f * pulse) * musicAlpha), glowColor), 1.6f * s);
+                g.DrawPath(thin, outline);
             }
             if (near > 0)
             {
@@ -1395,14 +1813,26 @@ internal sealed class CapsuleWindow : Form
                 pill.Add((Seg.Dot, "", 0, 0));
                 if (dropFiles.Length == 1)
                 {
-                    pill.Add((Seg.Text, "松手，收进", 0, 10));
+                    pill.Add((Seg.Text, L.T("松手，收进", "Drop to file into"), 0, 10));
                     pill.Add((Seg.Chip, app.CategoryNameFor(dropFiles[0]), 0, 8));
                 }
-                else pill.Add((Seg.Text, $"松手，收纳 {dropFiles.Length} 个文件", 0, 10));
+                else pill.Add((Seg.Text, L.T($"松手，收纳 {dropFiles.Length} 个文件", $"Drop to file {dropFiles.Length} items"), 0, 10));
                 break;
 
-            case Mode.Notify when notePath == null && downloadName != null:
-                pill.Add((Seg.Muted, "正在下载", 0, 0));
+            case Mode.Notify when chargeNote:
+                pill.Add((Seg.Battery, "", 0, 0));
+                pill.Add((Seg.Text, L.T("正在充电", "Charging"), 0, 10));
+                pill.Add((Seg.Bold, $"{(int)Math.Round(chargePercent * 100)}%", 0, 8));
+                break;
+
+            case Mode.Notify when adNote:
+                pill.Add((Seg.Dot, "", 0, 0));
+                pill.Add((Seg.Text, adNoteText, 0, 10));
+                if (adNoteChip) pill.Add((Seg.Chip, L.T("跳过", "Skip"), 0, 10));
+                break;
+
+            case Mode.Notify when notePath == null && downloadName != null && !Focusing:
+                pill.Add((Seg.Muted, L.T("正在下载", "Downloading"), 0, 0));
                 pill.Add((Seg.Text, Shorten(downloadName, 22), 0, 10));
                 pill.Add((Seg.Bar, "", 0, 12));
                 break;
@@ -1413,16 +1843,40 @@ internal sealed class CapsuleWindow : Form
                 if (noteFence != null) pill.Add((Seg.Chip, noteFence.Name, 0, 8));
                 else if (notePage is { } kind && IndexOfKind(kind) is int at and >= 0) pill.Add((Seg.Chip, pages[at].Name, 0, 8));
                 pill.Add((Seg.Text, Shorten(noteName, 18), 0, 8));
-                if (noteUndo) pill.Add((Seg.Chip, "撤销", 0, 10));
+                if (noteUndo) pill.Add((Seg.Chip, L.T("撤销", "Undo"), 0, 10));
+                break;
+
+            case Mode.Idle when focusEnd != null:
+                // 番茄钟：胶囊上只留一个小圆环和倒计时，别的都先不打扰
+                var left = FocusLeft < TimeSpan.Zero ? TimeSpan.Zero : FocusLeft;
+                pill.Add((Seg.Ring, "", 0, 0));
+                pill.Add((Seg.Count, $"{(int)left.TotalMinutes:00}:{left.Seconds:00}", 0, 10));
+                pill.Add((Seg.Muted, focusBreak ? L.T("休息一下", "Break") : L.T("专注中", "Focusing"), 0, 8));
                 break;
 
             case Mode.Idle when media is { Playing: true } && app.Config.ShowNowPlaying:
-                // 在放歌/视频：胶囊上显示正在放什么，像灵动岛
+                // 在放歌/视频：胶囊上显示正在放什么，像灵动岛；开了“收起时滚动歌词”就显示正在唱的那句
                 pill.Add((Seg.Note, "", 0, 0));
-                var (songTitle, songArtist) = Pretty(media);
-                pill.Add((Seg.Text, Shorten(songTitle, 24), 0, 10));
-                if (songArtist.Length > 0) pill.Add((Seg.Muted, Shorten(songArtist, 14), 0, 8));
-                if (app.Config.MusicMotion) pill.Add((Seg.Wave, "", 0, 10));
+                if (PillLyricLine() is { } line)
+                {
+                    line = Shorten(line, 22);
+                    if (line != pillLyric)
+                    {
+                        pillLyricPrev = pillLyric;
+                        pillLyric = line;
+                        pillLyricSince = pillLyricPrev.Length > 0 ? Now : -1;
+                        Kick();
+                    }
+                    pill.Add((Seg.Lyric, line, 0, 10));
+                }
+                else
+                {
+                    pillLyric = pillLyricPrev = "";
+                    var (songTitle, songArtist) = Pretty(media);
+                    pill.Add((Seg.Text, Shorten(songTitle, 24), 0, 10));
+                    if (songArtist.Length > 0) pill.Add((Seg.Muted, Shorten(songArtist, 14), 0, 8));
+                }
+                if (app.Config.MusicMotion && !Focusing) pill.Add((Seg.Wave, "", 0, 10));
                 break;
 
             default:
@@ -1430,13 +1884,13 @@ internal sealed class CapsuleWindow : Form
                 pill.Add((Seg.Dot, "", 0, 0));
                 if (today > 0)
                 {
-                    pill.Add((Seg.Text, "今天", 0, 10));
+                    pill.Add((Seg.Text, L.T("今天", "Today"), 0, 10));
                     pill.Add((Seg.Bold, $"+{today}", 0, 4));
                 }
                 else pill.Add((Seg.Text, Greeting(), 0, 10));
                 pill.Add((Seg.Sep, "", 0, 10));
                 pill.Add((Seg.Bold, app.TotalCount.ToString(), 0, 10));
-                pill.Add((Seg.Muted, "个文件", 0, 4));
+                pill.Add((Seg.Muted, L.T("个文件", "files"), 0, 4));
                 break;
         }
 
@@ -1451,6 +1905,10 @@ internal sealed class CapsuleWindow : Form
                 Seg.Wave => 18,
                 Seg.Sep => 1,
                 Seg.Bar => 96,
+                Seg.Battery => 24,
+                Seg.Ring => 16,
+                Seg.Count => Measure("88:88", boldFont), // 固定宽度：数字每秒在变，胶囊不跟着抖
+                Seg.Lyric => Math.Max(Measure(text, pillFont), 170), // 短句也留这么宽：一句句换时胶囊不忽宽忽窄
                 Seg.Chip => Measure(text, chipFont) + 18,
                 _ => Measure(text, kind == Seg.Bold ? boldFont : pillFont),
             };
@@ -1459,7 +1917,8 @@ internal sealed class CapsuleWindow : Form
         }
         pillWidth = total;
 
-        string key = mode + string.Join("|", pill.Select(p => p.Text));
+        // 倒计时的数字、一句句的歌词有自己的过渡，不算“换内容”（不然每秒都整行淡入一次）
+        string key = mode + string.Join("|", pill.Select(p => p.Kind is Seg.Count or Seg.Lyric ? p.Kind.ToString() : p.Text));
         if (key != pillKey)
         {
             if (pillKey.Length > 0) pillSwap = Now;
@@ -1475,11 +1934,11 @@ internal sealed class CapsuleWindow : Form
 
     static string Greeting() => DateTime.Now.Hour switch
     {
-        >= 5 and < 11 => "早上好",
-        >= 11 and < 13 => "中午好",
-        >= 13 and < 18 => "下午好",
-        >= 18 and < 23 => "晚上好",
-        _ => "夜深了",
+        >= 5 and < 11 => L.T("早上好", "Good morning"),
+        >= 11 and < 13 => L.T("中午好", "Good day"),
+        >= 13 and < 18 => L.T("下午好", "Good afternoon"),
+        >= 18 and < 23 => L.T("晚上好", "Good evening"),
+        _ => L.T("夜深了", "It's late"),
     };
 
     void DrawPill(Graphics g, RectangleF c, float alpha)
@@ -1506,7 +1965,7 @@ internal sealed class CapsuleWindow : Form
                     Fill(g, new RectangleF(x, cy - 7 * s, Math.Max(1, s), 14 * s), Ink(.3f * alpha));
                     break;
                 case Seg.Note when media?.Art is { } disc:
-                    DrawDisc(g, disc, x + w / 2, cy, 12 * s, alpha, spin: app.Config.MusicMotion && media.Playing);
+                    DrawDisc(g, disc, x + w / 2, cy, 12 * s, alpha, spin: app.Config.MusicMotion && media.Playing && !Focusing);
                     break;
                 case Seg.Wave:
                     // 跟着声音跳的四根音柱（只在放歌、胶囊露在外面时每秒 20 帧地动）
@@ -1540,6 +1999,23 @@ internal sealed class CapsuleWindow : Form
                     FillRound(g, new RectangleF(x, cy - 10 * s, w, 20 * s), 10 * s, Ink(.16f * alpha));
                     DrawTight(g, text, chipFont, Ink(alpha), x + 9 * s, cy);
                     break;
+                case Seg.Battery:
+                    DrawBattery(g, x, cy, alpha);
+                    break;
+                case Seg.Ring:
+                    DrawFocusRing(g, x + w / 2, cy, 7 * s, alpha);
+                    break;
+                case Seg.Count:
+                    DrawTight(g, text, boldFont, Ink(alpha), x + (w - Measure(text, boldFont) * s) / 2, cy);
+                    break;
+                case Seg.Lyric:
+                    // 换句：旧的往上退着淡掉，新的从下面浮上来
+                    float roll = animate && pillLyricSince >= 0 ? Math.Clamp((Now - pillLyricSince) / 320f, 0, 1) : 1;
+                    float re = 1 - (1 - roll) * (1 - roll) * (1 - roll);
+                    if (roll < 1 && pillLyricPrev.Length > 0)
+                        DrawTight(g, pillLyricPrev, pillFont, Ink(alpha * (1 - re)), x + (w - Measure(pillLyricPrev, pillFont) * s) / 2, cy - re * 11 * s);
+                    DrawTight(g, text, pillFont, Ink(alpha * (roll < 1 ? re : 1)), x + (w - Measure(text, pillFont) * s) / 2, cy + (1 - re) * 11 * s);
+                    break;
                 default:
                     var font = kind == Seg.Bold ? boldFont : pillFont;
                     DrawTight(g, text, font, Ink(kind == Seg.Muted ? .68f * alpha : alpha), x, cy);
@@ -1561,8 +2037,10 @@ internal sealed class CapsuleWindow : Form
     void LayoutPanel(RectangleF c)
     {
         float s = S;
-        searchRect = new RectangleF(c.X + 18 * s, c.Y + 16 * s, c.Width - 36 * s - 104 * s - 44 * s, 38 * s);
-        gearRect = new RectangleF(searchRect.Right + 6 * s, searchRect.Y + 2 * s, 34 * s, 34 * s);
+        float timer = app.Config.FocusTimer ? 40 : 0; // 开了番茄钟：搜索框让出一个按钮的位置
+        searchRect = new RectangleF(c.X + 18 * s, c.Y + 16 * s, c.Width - 36 * s - 104 * s - 44 * s - timer * s, 38 * s);
+        focusRect = timer > 0 ? new RectangleF(searchRect.Right + 6 * s, searchRect.Y + 2 * s, 34 * s, 34 * s) : RectangleF.Empty;
+        gearRect = new RectangleF((timer > 0 ? focusRect.Right : searchRect.Right) + 6 * s, searchRect.Y + 2 * s, 34 * s, 34 * s);
         // 分类一排放不下时可以左右滚（滚轮在这一排上滚，或者切换时自动滚到当前那个）
         chipRow = new RectangleF(c.X + 14 * s, c.Y + 66 * s, c.Width - 28 * s, 30 * s);
         chipRects.Clear();
@@ -1738,16 +2216,26 @@ internal sealed class CapsuleWindow : Form
 
     readonly List<float> chipWidths = new();
 
+    /// <summary>界面语言换了：页签名、胶囊上的字重新排。</summary>
+    public void LanguageChanged()
+    {
+        Text = L.T("玻璃收纳", "GlassBox");
+        BuildPages();
+        BuildPill();
+        if (mode == Mode.Open) RefreshShown(keepScroll: true);
+        Redraw();
+    }
+
     void BuildPages()
     {
         var current = CurrentPage;
         pages.Clear();
-        pages.Add(new Page(PageKind.Frequent, "常用", null, app.FrequentItems(FrequentMax).Count));
-        pages.Add(new Page(PageKind.Downloads, "最近下载", null, app.RecentDownloads.Count));
+        pages.Add(new Page(PageKind.Frequent, L.T("常用", "Frequent"), null, app.FrequentItems(FrequentMax).Count));
+        pages.Add(new Page(PageKind.Downloads, L.T("最近下载", "Downloads"), null, app.RecentDownloads.Count));
         foreach (var fence in app.Config.Fences) pages.Add(new Page(PageKind.Fence, fence.Name, fence, app.CountOf(fence)));
         // 「图像」和分类排在一起，可以拖到任何位置
         if (app.Config.ScreenshotPage)
-            pages.Insert(2 + Math.Clamp(app.Config.ScreenshotSlot, 0, app.Config.Fences.Count), new Page(PageKind.Screenshots, "图像", null, app.Screenshots.Count));
+            pages.Insert(2 + Math.Clamp(app.Config.ScreenshotSlot, 0, app.Config.Fences.Count), new Page(PageKind.Screenshots, L.T("图像", "Images"), null, app.Screenshots.Count));
 
         if (current is { } was)
         {
@@ -1799,16 +2287,21 @@ internal sealed class CapsuleWindow : Form
         else
         {
             if (focused && caretOn) Fill(g, new RectangleF(textBox.X, textY - 9 * s, 1.5f * s, 18 * s), Ink(.9f * a));
-            string hint = focused ? $"直接输入，搜索 {app.TotalCount} 个文件" : $"搜索 {app.TotalCount} 个文件";
+            string hint = focused ? L.T($"直接输入，搜索 {app.TotalCount} 个文件", $"Type to search {app.TotalCount} files") : L.T($"搜索 {app.TotalCount} 个文件", $"Search {app.TotalCount} files");
             DrawTight(g, hint, searchFont, Ink(.55f * a), textBox.X + (focused ? 5 * s : 0), textY);
         }
         g.Restore(clip);
+        DrawFocusButton(g, a);
         DrawGear(g, a);
 
-        // 时间
+        // 时间（番茄钟在走时，日期那行换成还剩多久）
         var now = DateTime.Now;
         clockShown = now.ToString("HH:mm");
-        string date = $"{now.Month}月{now.Day}日 周{"日一二三四五六"[(int)now.DayOfWeek]}";
+        var focusLeft = FocusLeft < TimeSpan.Zero ? TimeSpan.Zero : FocusLeft;
+        string left = $"{(int)focusLeft.TotalMinutes:00}:{focusLeft.Seconds:00}";
+        string date = focusEnd != null ? L.T($"{(focusBreak ? "休息" : "专注")} 还剩 {left}", $"{(focusBreak ? "Break" : "Focus")} {left} left")
+            : L.En ? now.ToString("ddd, MMM d", System.Globalization.CultureInfo.InvariantCulture)
+            : $"{now.Month}月{now.Day}日 周{"日一二三四五六"[(int)now.DayOfWeek]}";
         float right = c.Right - 18 * s;
         DrawTight(g, clockShown, clockFont, Ink(a), right - Measure(clockShown, clockFont) * s, searchRect.Y + 13 * s);
         DrawTight(g, date, smallFont, Ink(.65f * a), right - Measure(date, smallFont) * s, searchRect.Y + 32 * s);
@@ -1869,12 +2362,12 @@ internal sealed class CapsuleWindow : Form
         g.SetClip(gridRect, CombineMode.Intersect);
         if (shown.Count == 0)
         {
-            string empty = searching ? $"没有找到“{query}”" : CurrentPage?.Kind switch
+            string empty = searching ? L.T($"没有找到“{query}”", $"No results for “{query}”") : CurrentPage?.Kind switch
             {
-                PageKind.Frequent => "常打开的文件会自动出现在这里",
-                PageKind.Downloads => "最近 30 天下载的东西会自动出现在这里",
-                PageKind.Screenshots => "截的图（Win+Shift+S、PrtSc）会自动出现在这里",
-                _ => "这里还是空的，把文件拖到胶囊上试试",
+                PageKind.Frequent => L.T("常打开的文件会自动出现在这里", "Files you open often show up here"),
+                PageKind.Downloads => L.T("最近 30 天下载的东西会自动出现在这里", "Downloads from the last 30 days show up here"),
+                PageKind.Screenshots => L.T("截的图（Win+Shift+S、PrtSc）会自动出现在这里", "Screenshots (Win+Shift+S, PrtSc) show up here"),
+                _ => L.T("这里还是空的，把文件拖到胶囊上试试", "Nothing here yet. Try dragging files onto the capsule"),
             };
             using var brush = new SolidBrush(Ink(.62f * a));
             g.DrawString(empty, labelFont, brush, gridRect, CenterFormat);
@@ -1896,7 +2389,7 @@ internal sealed class CapsuleWindow : Form
 
         // 底部：在放歌就是迷你播放器，不然是提示
         float fy = c.Bottom - 22 * s;
-        string keys = "空格预览 · Enter 打开 · 连按 Ctrl 呼出";
+        string keys = L.T("空格预览 · Enter 打开 · 连按 Ctrl 呼出", "Space preview · Enter open · Ctrl twice to summon");
         float keysW = Measure(keys, smallFont) * s;
         bool showKeys = c.Width > 600 * s && !trashOn; // 右下角的回收站条子出来时让开
         bool toast = Now < trashToastUntil;
@@ -1917,7 +2410,7 @@ internal sealed class CapsuleWindow : Form
         {
             Array.Clear(mediaButtons);
             playerInfo = RectangleF.Empty;
-            string hint = CanReorder ? "拖动图标可以调整顺序，拖到分类上就换分类" : "把文件拖到胶囊上，会自动收进对应分类";
+            string hint = CanReorder ? L.T("拖动图标可以调整顺序，拖到分类上就换分类", "Drag icons to reorder, drop on a category to move") : L.T("把文件拖到胶囊上，会自动收进对应分类", "Drag files onto the capsule to file them by type");
             DrawTight(g, hint, smallFont, Ink(.55f * a), c.X + 20 * s, fy);
         }
         if (!toast) trashUndoRect = RectangleF.Empty;
@@ -2079,10 +2572,10 @@ internal sealed class CapsuleWindow : Form
     static readonly StringFormat WrapFormat = new(StringFormatFlags.LineLimit) { Trimming = StringTrimming.EllipsisWord };
 
     /// <summary>鼠标停上去（或点）展开成什么：在放歌就是音乐卡片，不然是文件面板。</summary>
-    Mode HoverTarget => media is { Playing: true } && app.Config.ShowNowPlaying && app.Config.MusicCard ? Mode.Music : Mode.Open;
+    Mode HoverTarget => media is { Playing: true } && app.Config.ShowNowPlaying && app.Config.MusicCard && floatWin == null ? Mode.Music : Mode.Open;
 
     /// <summary>现在要不要一直出帧：唱片在转、音柱在跳、歌词在走。胶囊缩着、被窗口挡着、全屏时都不动。</summary>
-    bool MusicLive => media is { Playing: true } && Visible && !Tucked && !fullscreenBusy
+    bool MusicLive => (media is { Playing: true } || media != null && TurntableMoving) && Visible && !Tucked && !fullscreenBusy && (!Focusing || mode == Mode.Music)
         && (mode == Mode.Music || mode == Mode.Idle && app.Config.MusicMotion && app.Config.ShowNowPlaying && (uncovered || Floating));
 
     /// <summary>封面框的宽：按封面本来的比例（视频是宽的），太宽太窄都收一点。</summary>
@@ -2090,6 +2583,7 @@ internal sealed class CapsuleWindow : Form
     {
         get
         {
+            if (app.Config.Turntable) return MusicArtH * 1.12f; // 唱片机：右边留出唱臂的位置
             var cover = media?.Cover;
             float aspect = cover != null && cover.Height > 0 ? cover.Width / (float)cover.Height : 1;
             return Math.Clamp(MusicArtH * aspect, MusicArtH * .75f, MusicArtMaxW);
@@ -2104,17 +2598,51 @@ internal sealed class CapsuleWindow : Form
 
     void EnterMusic()
     {
+        CloseFloat();
         musicLast = true;
         panelLast = false;
         seekDrag = volumeDrag = false;
         lyricIndex = -1;
         ReadVolume();
         EnsureLyrics();
+        if (app.Config.BluetoothBattery) ReadBluetooth();
+    }
+
+    void ReadBluetooth()
+    {
+        btRead = Now;
+        if (btReading) return;
+        btReading = true;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            List<(string, int)> levels;
+            try { levels = BluetoothBattery.Read(); }
+            catch (Exception ex)
+            {
+                Log.Error(ex);
+                levels = new();
+            }
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    btReading = false;
+                    btLevels = levels;
+                    Redraw();
+                }));
+            }
+            catch (InvalidOperationException) { } // 正在退出
+        });
     }
 
     void LeaveMusic()
     {
-        seekDrag = volumeDrag = false;
+        seekDrag = volumeDrag = cardPressed = false;
+        if (musicRaised)
+        {
+            musicRaised = false;
+            sinkPending = true; // Ctrl 叫出来浮在最上面的：缩回去后沉回桌面层
+        }
     }
 
     void ReadVolume()
@@ -2123,6 +2651,7 @@ internal sealed class CapsuleWindow : Form
         var v = media == null ? null : Audio.GetVolume(media.Source);
         volume = v?.Volume ?? -1;
         volumePerApp = v?.PerApp ?? false;
+        output = Audio.DefaultOutput();
     }
 
     /// <summary>歌词开着、这首歌还没找过：后台去找（先看本地缓存），找到了重画。</summary>
@@ -2131,6 +2660,19 @@ internal sealed class CapsuleWindow : Form
         if (!app.Config.Lyrics || media == null) return;
         string key = media.Title + "\n" + media.Artist;
         if (key == lyricsKey) return;
+        if (media.Settling) return; // 刚换歌、时长还没报：等报了再找（找歌词要按时长挑版本）
+        FindLyrics(key, 0, null);
+    }
+
+    /// <summary>右键“换一个版本”“手动搜索”：不看缓存，重新找，挑中的存起来。</summary>
+    void RefindLyrics(int choice, string? search)
+    {
+        if (!app.Config.Lyrics || media == null) return;
+        FindLyrics(media.Title + "\n" + media.Artist, choice, search);
+    }
+
+    void FindLyrics(string key, int choice, string? search)
+    {
         lyricsKey = key;
         lyrics = null;
         lyricsLoading = true;
@@ -2138,12 +2680,13 @@ internal sealed class CapsuleWindow : Form
         lyricIndex = -1;
         lyricsCancel?.Cancel();
         var cancel = lyricsCancel = new CancellationTokenSource();
-        var (title, artist, duration) = (media.Title, media.Artist, media.Duration);
+        var query = new LyricsQuery(media!.Title, media.Artist, media.Duration, app.Config.NeteaseLyrics, choice, search,
+            app.Config.LyricTranslation && app.Config.NeteaseLyrics);
         Task.Run(async () =>
         {
             SongLyrics? found = null;
             bool offline = false;
-            try { found = await LyricsSource.FindAsync(title, artist, duration, cancel.Token); }
+            try { found = await LyricsSource.FindAsync(query, cancel.Token); }
             catch (OperationCanceledException) { return; }
             catch (LyricsUnavailableException) { offline = true; }
             catch (Exception ex) { Log.Error(ex); }
@@ -2157,7 +2700,9 @@ internal sealed class CapsuleWindow : Form
                     lyricsLoading = false;
                     lyricsOffline = offline;
                     if (offline) lyricsKey = ""; // 下次打开卡片再试
-                    lyricIndex = -1;
+                    lyricIndex = pillLyricIndex = -1;
+                    BuildPill(); // 收起时滚歌词：找到了就换上
+                    UpdateFloat();
                     Redraw();
                 }));
             }
@@ -2192,39 +2737,18 @@ internal sealed class CapsuleWindow : Form
         if (np == null)
         {
             using var brush = new SolidBrush(Ink(.6f * a));
-            g.DrawString("现在没有在播放", labelFont, brush, c, CenterFormat);
+            g.DrawString(L.T("现在没有在播放", "Nothing playing"), labelFont, brush, c, CenterFormat);
             return;
         }
         var mouse = PointToClient(Cursor.Position);
         float pad = MusicPad * s;
         // 卡片上小字多：玻璃调得很透、后面又是白色窗口时会看不清，按透明度铺一层薄底
         float clear = Math.Clamp((app.Config.GlassClarity - 40) / 60f, 0, 1);
-        if (clear > 0) Fill(g, c, app.Tone.DarkInk ? Color.FromArgb(Byte(.32f * clear * a), 255, 255, 255) : Deep(.45f * clear * a));
+        if (clear > 0 && !lightInk) Fill(g, c, app.Tone.DarkInk ? Color.FromArgb(Byte(.32f * clear * a), 255, 255, 255) : Deep(.45f * clear * a));
 
         // 封面：按比例铺满框，多出来的裁掉
         var art = new RectangleF(c.X + pad, c.Y + pad, MusicArtW * s, MusicArtH * s);
-        var cover = np.Cover ?? np.Art;
-        if (cover != null)
-        {
-            var state = g.Save();
-            using (var shape = Shapes.RoundRect(art, 14 * s))
-            {
-                g.SetClip(shape, CombineMode.Intersect);
-                float k = Math.Max(art.Width / cover.Width, art.Height / cover.Height);
-                float dw = cover.Width * k, dh = cover.Height * k;
-                DrawImage(g, cover, new RectangleF(art.X + (art.Width - dw) / 2, art.Y + (art.Height - dh) / 2, dw, dh), a);
-            }
-            g.Restore(state);
-            using var edge = new Pen(Color.FromArgb(Byte(.18f * a), 255, 255, 255), 1 * s);
-            using var outline = Shapes.RoundRect(RectangleF.Inflate(art, -.5f * s, -.5f * s), 14 * s);
-            g.DrawPath(edge, outline);
-        }
-        else
-        {
-            FillRound(g, art, 14 * s, Ink(.12f * a));
-            using var brush = new SolidBrush(Ink(.5f * a));
-            g.DrawString("♪", clockFont, brush, art, CenterFormat);
-        }
+        DrawArt(g, art, np, np.Cover ?? np.Art, a);
 
         // 中间：歌名、歌手、时间、进度、按钮
         float x0 = art.Right + 20 * s, iw = MusicInfoW * s;
@@ -2292,27 +2816,48 @@ internal sealed class CapsuleWindow : Form
             if (box.Width > 60 * s) DrawLyrics(g, box, position, a);
         }
 
-        // 底下一排：音量、定时暂停、切换来源、回到文件
+        // 右上角的小锁：鼠标在卡片上时浮出来，锁着时一直亮着（双击卡片也一样）
+        lockRect = new RectangleF(c.Right - 36 * s, c.Y + 8 * s, 28 * s, 28 * s);
+        bool lockHot = lockRect.Contains(mouse);
+        float lockAlpha = musicPinned ? 1 : c.Contains(mouse) ? (lockHot ? .9f : .42f) : 0;
+        if (lockAlpha > 0)
+        {
+            if (musicPinned) FillRound(g, lockRect, 14 * s, Ink(.9f * a));
+            else if (lockHot) FillRound(g, lockRect, 14 * s, Ink(.14f * a));
+            DrawLock(g, lockRect.X + lockRect.Width / 2, lockRect.Y + lockRect.Height / 2, musicPinned, musicPinned ? Deep(a) : Ink(lockAlpha * a));
+            musicHits.Add((lockRect, "lock", 0));
+        }
+
+        // 底下一排：音量（和现在从哪个设备出声）、定时暂停、切换来源、蓝牙耳机电量、跳过广告、回到文件
         float rcy = art.Bottom + 14 * s + MusicRowH * s / 2;
         float x = c.X + pad;
-        DrawSpeaker(g, x + 7 * s, rcy, a);
+        if (output is { Headphones: true }) DrawHeadphones(g, x - 1 * s, rcy, Ink(.8f * a));
+        else DrawSpeaker(g, x + 7 * s, rcy, a);
         x += 22 * s;
         var vt = new RectangleF(x, rcy - 2 * s, 110 * s, 4 * s);
         volumeTrack = vt;
-        FillRound(g, vt, 2 * s, Ink(.18f * a));
         if (volume >= 0)
         {
             var hit = RectangleF.Inflate(vt, 6 * s, 13 * s);
-            FillRound(g, new RectangleF(vt.X, vt.Y, Math.Max(vt.Height, vt.Width * volume), vt.Height), 2 * s, Ink(.85f * a));
-            if (volumeDrag || hit.Contains(mouse)) Knob(g, vt.X + vt.Width * volume, rcy, 6.5f * s, a);
+            bool hot = volumeDrag || hit.Contains(mouse);
+            if (hot) vt.Inflate(0, 1.5f * s); // 鼠标过来：变粗一点
+            FillRound(g, vt, vt.Height / 2, Ink(.18f * a));
+            var level = new RectangleF(vt.X, vt.Y, Math.Max(vt.Height, vt.Width * volume), vt.Height);
+            if (amount > .05f) FillRound(g, RectangleF.Inflate(level, 2.5f * s, 2.5f * s), level.Height, Color.FromArgb(Byte((hot ? .3f : .16f) * amount * a), accent)); // 一层歌曲颜色的光
+            FillRound(g, level, vt.Height / 2, Color.FromArgb(Byte(.92f * a), Mix(Ink(1), Mix(accent, Color.White, .25f), amount)));
+            if (hot) Knob(g, vt.X + vt.Width * volume, rcy, 6.5f * s, a);
             musicHits.Add((hit, "volume", 0));
-            string pct = $"{(int)Math.Round(volume * 100)}%" + (volumePerApp ? "" : " 系统");
+            string pct = $"{(int)Math.Round(volume * 100)}%" + (volumePerApp ? "" : L.T(" 系统", " system"));
             DrawTight(g, pct, smallFont, Ink(.65f * a), vt.Right + 10 * s, rcy);
-            x = vt.Right + 10 * s + Measure(pct, smallFont) * s + 18 * s;
+            x = vt.Right + 10 * s + Measure(pct, smallFont) * s + 12 * s;
         }
-        else x = vt.Right + 18 * s;
+        else
+        {
+            FillRound(g, vt, 2 * s, Ink(.18f * a));
+            x = vt.Right + 18 * s;
+        }
 
-        string files = "文件";
+        string files = L.T("文件", "Files");
         float fw = Measure(files, chipFont) * s + 40 * s;
         var fb = new RectangleF(c.Right - pad - fw, rcy - 13 * s, fw, 26 * s);
         FillRound(g, fb, 13 * s, fb.Contains(mouse) ? Ink(.18f * a) : Ink(.09f * a));
@@ -2322,33 +2867,484 @@ internal sealed class CapsuleWindow : Form
         musicHits.Add((fb, "files", 0));
         float limit = fb.X - 8 * s;
 
+        // YouTube 广告能跳过了：一颗亮着的按钮
+        if (adSkippable)
+        {
+            string skip = L.T("跳过广告", "Skip ad");
+            float kw = Measure(skip, chipFont) * s + 36 * s;
+            var kb = new RectangleF(limit - kw, rcy - 13 * s, kw, 26 * s);
+            FillRound(g, kb, 13 * s, Ink(.92f * a));
+            DrawSkip(g, kb.X + 15 * s, rcy, Deep(a));
+            DrawTight(g, skip, chipFont, Deep(a), kb.X + 26 * s, rcy);
+            musicHits.Add((kb, "skipad", 0));
+            limit = kb.X - 8 * s;
+        }
+
+        // 现在从哪里出声：“WH-1000XM5 · 76%”（蓝牙耳机报了电量就带上）；开了切换的话是一颗能点的小胶囊
+        string? matched = null;
+        if (output is { } device)
+        {
+            string name = DeviceName(device);
+            int battery = -1;
+            if (app.Config.BluetoothBattery)
+                foreach (var (btName, percent) in btLevels)
+                    if (device.Name.Contains(btName, StringComparison.OrdinalIgnoreCase) || btName.Contains(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        battery = percent;
+                        matched = btName;
+                        break;
+                    }
+            string text = battery >= 0 ? $"{name} · {battery}%" : name;
+            if (app.Config.OutputSwitch)
+            {
+                float used = MusicChip(g, x, rcy, text, "output", 0, false, mouse, a, limit - 120 * s);
+                if (used > 0) x += used + 8 * s;
+            }
+            else if (x + Measure(text, smallFont) * s < limit - 120 * s)
+            {
+                var color = battery is >= 0 and <= 20 ? Color.FromArgb(Byte(a), 248, 113, 113) : Ink(.55f * a);
+                DrawTight(g, text, smallFont, color, x, rcy);
+                x += Measure(text, smallFont) * s + 14 * s;
+            }
+        }
+
+        // 别的蓝牙耳机电量（不是现在出声的那副）：排在右边；地方不够先省掉名字，再不够就不显示
+        if (app.Config.BluetoothBattery)
+            foreach (var (name, percent) in btLevels.Where(b => b.Name != matched).Take(2))
+            {
+                float taken = DrawEarbuds(g, limit, rcy, name, percent, x + 120 * s, a);
+                if (taken <= 0) break;
+                limit -= taken + 10 * s;
+            }
+
         var sleep = app.Media?.SleepAtUtc;
-        string sleepText = sleep is { } at ? $"{Clock(at - DateTime.UtcNow)} 后暂停" : "定时暂停";
-        float used = MusicChip(g, x, rcy, sleepText, "sleep", 0, sleep != null, mouse, a, limit);
-        if (used > 0) x += used + 8 * s;
+        string sleepText = sleep is { } at ? L.T($"{Clock(at - DateTime.UtcNow)} 后暂停", $"Pause in {Clock(at - DateTime.UtcNow)}") : L.T("定时暂停", "Sleep timer");
+        float chip = MusicChip(g, x, rcy, sleepText, "sleep", 0, sleep != null, mouse, a, limit);
+        if (chip > 0) x += chip + 8 * s;
         if (np.Sources.Length > 1)
         {
             for (int i = 0; i < np.Sources.Length && i < 4; i++)
             {
-                used = MusicChip(g, x, rcy, AppName(np.Sources[i]), "source", i, np.Sources[i] == np.Source, mouse, a, limit);
-                if (used < 0) break;
-                x += used + 6 * s;
+                chip = MusicChip(g, x, rcy, AppName(np.Sources[i]), "source", i, np.Sources[i] == np.Source, mouse, a, limit);
+                if (chip < 0) break;
+                x += chip + 6 * s;
             }
         }
         else
         {
-            string from = "来自 " + AppName(np.Source);
+            string from = L.T("来自 ", "from ") + AppName(np.Source);
             if (x + Measure(from, smallFont) * s < limit) DrawTight(g, from, smallFont, Ink(.5f * a), x + 4 * s, rcy);
         }
+
+        DrawVolumeBubble(g, art, a);
+    }
+
+    /// <summary>封面：按比例铺满框，多出来的裁掉；没有封面画一个音符。</summary>
+    void DrawCover(Graphics g, RectangleF art, Bitmap? cover, float a)
+    {
+        float s = S;
+        if (cover != null)
+        {
+            var state = g.Save();
+            using (var shape = Shapes.RoundRect(art, 14 * s))
+            {
+                g.SetClip(shape, CombineMode.Intersect);
+                float k = Math.Max(art.Width / cover.Width, art.Height / cover.Height);
+                float dw = cover.Width * k, dh = cover.Height * k;
+                DrawImage(g, cover, new RectangleF(art.X + (art.Width - dw) / 2, art.Y + (art.Height - dh) / 2, dw, dh), a);
+            }
+            g.Restore(state);
+            using var edge = new Pen(Color.FromArgb(Byte(.18f * a), 255, 255, 255), 1 * s);
+            using var outline = Shapes.RoundRect(RectangleF.Inflate(art, -.5f * s, -.5f * s), 14 * s);
+            g.DrawPath(edge, outline);
+        }
+        else
+        {
+            FillRound(g, art, 14 * s, Ink(.12f * a));
+            using var brush = new SolidBrush(Ink(.5f * a));
+            g.DrawString("♪", clockFont, brush, art, CenterFormat);
+        }
+    }
+
+    // ---------- 唱片机（设置里打开后代替方封面） ----------
+
+    float turnAngle, turnSpeed, armPos; // 唱片转到的角度、转速（0 停 … 1 全速）、唱臂（0 搁着 … 1 落在唱片上）
+    double turnLast = -1;               // 上一帧的时间（毫秒，高精度：系统的毫秒计数一跳 16ms，转起来会一顿一顿）
+    volatile bool pacerHalf;            // 只有唱片在转：跟着屏幕刷新出帧，但每秒 30 帧就够（均匀比帧多更顺）
+
+    static double FineNow => Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
+
+    /// <summary>唱片机正在卡片上转、唱臂在动（桌面小播放器有自己的计时器）。</summary>
+    bool TurntableShown => app.Config.Turntable && mode == Mode.Music && (turnSpeed > .005f || armPos > .001f && armPos < .999f || media is { Playing: true });
+    Bitmap? deckCache;                  // 底座、唱盘、沟槽、反光：不动的部分画一次存着
+    (int W, int H, int Tint) deckKey;
+
+    /// <summary>唱片还在慢慢停、唱臂还在抬：暂停后也要再出几帧。</summary>
+    bool TurntableMoving => app.Config.Turntable && (turnSpeed > .005f || armPos > .001f && armPos < .999f);
+
+    /// <summary>卡片上的封面：唱片机打开了就画唱片机，不然画方封面。</summary>
+    void DrawArt(Graphics g, RectangleF art, NowPlaying np, Bitmap? cover, float a)
+    {
+        if (app.Config.Turntable) DrawTurntable(g, art, cover, np.Playing, a);
+        else DrawCover(g, art, cover, a);
+    }
+
+    /// <summary>
+    /// 唱片机：深色拉丝底座，金属唱盘上一张黑胶，封面做中间的标签跟着转；反光不跟着转（灯在外面），
+    /// 所以转起来像真的。放歌时唱臂落下、唱片起转；暂停时唱片慢慢停、唱臂抬回支架。
+    /// </summary>
+    void DrawTurntable(Graphics g, RectangleF art, Bitmap? cover, bool playing, float a)
+    {
+        float s = S;
+        // 动画：按真实经过的时间走；很久没画（卡片刚打开）就直接到位，不从头演一遍
+        double now = FineNow;
+        bool first = turnLast < 0; // 头一次画：直接到位
+        float dt = first ? 0 : (float)(now - turnLast);
+        turnLast = now;
+        float want = playing ? 1 : 0;
+        if (dt > 400) dt = 16; // 停了一阵又画（暂停后按播放）：从现在的样子接着演
+        if (first || !animate)
+        {
+            turnSpeed = armPos = want;
+        }
+        else
+        {
+            // 放歌：唱臂先落（0.7 秒），落到了唱片才起转；暂停：唱片 1.2 秒慢慢停，唱臂同时抬起
+            armPos = Math.Clamp(armPos + (playing ? 1 : -1) * dt / 700f, 0, 1);
+            float target = playing && armPos >= 1 ? 1 : 0;
+            turnSpeed += (target - turnSpeed) * Math.Min(1, dt / (target > turnSpeed ? 450f : 380f));
+            if (turnSpeed < .004f && target == 0) turnSpeed = 0;
+            turnAngle = (turnAngle + turnSpeed * dt * 360 / 2600f) % 360; // 2.6 秒一圈
+        }
+
+        var (accent, amount) = Accent();
+        float r = Math.Min(art.Height * .41f, art.Width * .37f);
+        float cx = art.X + art.Height * .08f + r, cy = art.Y + art.Height / 2;
+        float label = r * .6f; // 封面做的标签：比真唱片的大，照片看得清，外面还留一圈沟槽
+
+        // 不动的部分：从缓存贴上去
+        int w = (int)Math.Ceiling(art.Width), h = (int)Math.Ceiling(art.Height);
+        var key = (w, h, accent.ToArgb() & 0xF0F0F0);
+        if (deckCache == null || deckKey != key)
+        {
+            deckCache?.Dispose();
+            deckCache = new Bitmap(Math.Max(1, w), Math.Max(1, h), PixelFormat.Format32bppPArgb);
+            deckKey = key;
+            using var dg = Graphics.FromImage(deckCache);
+            dg.SmoothingMode = SmoothingMode.AntiAlias;
+            dg.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            DrawDeck(dg, new RectangleF(0, 0, art.Width, art.Height), cx - art.X, cy - art.Y, r, label, accent, amount);
+        }
+        DrawImage(g, deckCache, new RectangleF(art.X, art.Y, deckCache.Width, deckCache.Height), a);
+
+        // 标签：封面做成圆的，跟着唱片转
+        if (cover != null && LabelFace(cover, (int)Math.Ceiling(label * 2)) is { } face)
+        {
+            using var attributes = a < .99f ? Fade(a) : null;
+            using var brush = attributes != null ? new TextureBrush(face, new Rectangle(0, 0, face.Width, face.Height), attributes) : new TextureBrush(face);
+            brush.WrapMode = WrapMode.Clamp;
+            float k = 2 * label / face.Width;
+            using var m = new Matrix();
+            m.Translate(cx, cy);
+            m.Rotate(turnAngle);
+            m.Scale(k, k);
+            m.Translate(-face.Width / 2f, -face.Height / 2f);
+            brush.Transform = m;
+            g.FillEllipse(brush, cx - label, cy - label, label * 2, label * 2);
+        }
+        else
+        {
+            using var plain = new SolidBrush(Color.FromArgb(Byte(a), Mix(accent, Color.FromArgb(70, 74, 82), 1 - amount * .8f)));
+            g.FillEllipse(plain, cx - label, cy - label, label * 2, label * 2);
+        }
+        // 标签边上一圈压痕、一点点从左上来的光
+        using (var rim = new Pen(Color.FromArgb(Byte(.55f * a), 0, 0, 0), 1.2f * s)) g.DrawEllipse(rim, cx - label, cy - label, label * 2, label * 2);
+        using (var gloss = new GraphicsPath())
+        {
+            gloss.AddEllipse(cx - label, cy - label, label * 2, label * 2);
+            using var shine = new LinearGradientBrush(new PointF(cx - label, cy - label), new PointF(cx + label * .3f, cy + label * .3f),
+                Color.FromArgb(Byte(.16f * a), 255, 255, 255), Color.FromArgb(0, 255, 255, 255));
+            g.FillPath(shine, gloss);
+        }
+        // 中心轴：一颗小金属钮
+        float pin = 3.2f * s;
+        using (var axle = new LinearGradientBrush(new PointF(cx - pin, cy - pin), new PointF(cx + pin, cy + pin), Color.FromArgb(Byte(a), 236, 239, 243), Color.FromArgb(Byte(a), 96, 101, 109)))
+            g.FillEllipse(axle, cx - pin, cy - pin, pin * 2, pin * 2);
+
+        DrawTonearm(g, art, cx, cy, r, a);
+
+        // 左下角的电源灯：放歌时亮成歌曲的颜色
+        float led = 2.6f * s, lx = art.X + 10 * s, ly = art.Bottom - 10 * s;
+        var on = Mix(Color.FromArgb(120, 255, 170), accent, amount * .8f);
+        if (armPos > .5f)
+        {
+            using var halo = new GraphicsPath();
+            halo.AddEllipse(lx - led * 3, ly - led * 3, led * 6, led * 6);
+            using var glow = new PathGradientBrush(halo) { CenterColor = Color.FromArgb(Byte(.5f * a), on), SurroundColors = new[] { Color.FromArgb(0, on) } };
+            g.FillPath(glow, halo);
+        }
+        using (var dot = new SolidBrush(armPos > .5f ? Color.FromArgb(Byte(a), on) : Color.FromArgb(Byte(.7f * a), 60, 63, 68)))
+            g.FillEllipse(dot, lx - led, ly - led, led * 2, led * 2);
+    }
+
+    Bitmap? labelFace;   // 做好的圆标签（方的）：每首歌做一次
+    Bitmap? labelFrom;   // 是用哪张封面做的（只比对是不是同一张，不再用它）
+    int labelSide;
+
+    /// <summary>
+    /// 唱片中间的标签图。差不多方的封面：铺满裁成圆。太宽/太高的（MV 缩略图常常很扁）：铺满的话只剩中间一小块，
+    /// 人和画面都切掉了；改成底下铺一层同一张图放大、模糊、压暗，中间放完整的照片。
+    /// </summary>
+    Bitmap? LabelFace(Bitmap cover, int side)
+    {
+        side = Math.Clamp(side * 2, 64, 512); // 做大一点：转起来缩放时不糊
+        if (ReferenceEquals(labelFrom, cover) && labelSide == side) return labelFace; // 做过了（做失败的也不再试）
+        labelFace?.Dispose();
+        labelFace = null;
+        labelFrom = cover;
+        labelSide = side;
+        try
+        {
+            var face = new Bitmap(side, side, PixelFormat.Format32bppPArgb);
+            using var g = Graphics.FromImage(face);
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            float aspect = cover.Width / (float)Math.Max(1, cover.Height);
+            using var wrap = new ImageAttributes();
+            wrap.SetWrapMode(WrapMode.TileFlipXY); // 边上不要混进一圈透明
+            void Put(Image image, RectangleF to) =>
+                g.DrawImage(image, Rectangle.Round(to), 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, wrap);
+            // 铺满（多出来的裁掉）
+            float fill = side / Math.Min((float)cover.Width, cover.Height);
+            var full = new RectangleF((side - cover.Width * fill) / 2, (side - cover.Height * fill) / 2, cover.Width * fill, cover.Height * fill);
+            if (aspect is > .8f and < 1.25f) Put(cover, full);
+            else
+            {
+                // 模糊的底：先缩成很小再放大，自然就糊了；再压暗一点，中间的照片才显眼
+                using (var tiny = new Bitmap(10, 10, PixelFormat.Format32bppPArgb))
+                {
+                    using (var tg = Graphics.FromImage(tiny))
+                    {
+                        tg.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                        int sq = Math.Min(cover.Width, cover.Height); // 取中间方的一块来糊
+                        tg.DrawImage(cover, new Rectangle(0, 0, 10, 10), (cover.Width - sq) / 2, (cover.Height - sq) / 2, sq, sq, GraphicsUnit.Pixel);
+                    }
+                    g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    Put(tiny, new RectangleF(-side * .1f, -side * .1f, side * 1.2f, side * 1.2f));
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                }
+                using (var dim = new SolidBrush(Color.FromArgb(90, 0, 0, 0))) g.FillRectangle(dim, 0, 0, side, side);
+                // 整张照片放中间：四个角都要在圆里（对角线不超过标签的 94%）
+                float k = side * .94f / MathF.Sqrt(cover.Width * (float)cover.Width + cover.Height * (float)cover.Height);
+                var fit = new RectangleF((side - cover.Width * k) / 2, (side - cover.Height * k) / 2, cover.Width * k, cover.Height * k);
+                using (var shadow = new SolidBrush(Color.FromArgb(70, 0, 0, 0))) g.FillRectangle(shadow, fit.X, fit.Y + side * .015f, fit.Width, fit.Height);
+                Put(cover, fit);
+            }
+            labelFace = face;
+        }
+        catch (Exception ex) { Log.Error(ex); } // 封面刚被换掉释放了：这帧先不画标签
+        return labelFace;
+    }
+
+    /// <summary>不动的部分：底座、唱盘、黑胶和沟槽、固定的反光。画在缓存里，坐标从 (0,0) 起。</summary>
+    void DrawDeck(Graphics g, RectangleF box, float cx, float cy, float r, float label, Color accent, float amount)
+    {
+        float s = S, radius = 14 * s;
+        // 底座：深色拉丝金属，带一点歌曲的颜色，上沿一道细高光
+        using (var shape = Shapes.RoundRect(box, radius))
+        {
+            var top = Mix(Color.FromArgb(58, 61, 67), accent, .10f * amount);
+            var bottom = Mix(Color.FromArgb(26, 27, 30), accent, .05f * amount);
+            using (var body = new LinearGradientBrush(new PointF(0, box.Y), new PointF(0, box.Bottom + 1), top, bottom)) g.FillPath(body, shape);
+            var state = g.Save();
+            g.SetClip(shape, CombineMode.Intersect);
+            var rng = new Random(7);
+            for (float y = box.Y + 1; y < box.Bottom; y += 1.5f * s) // 拉丝：一条条深浅不一的横线
+            {
+                using var line = new Pen(Color.FromArgb(rng.Next(2, 8), rng.Next(2) == 0 ? Color.White : Color.Black), .6f * s);
+                g.DrawLine(line, box.X, y, box.Right, y + (float)(rng.NextDouble() - .5) * s);
+            }
+            g.Restore(state);
+            using (var edge = new Pen(Color.FromArgb(70, 255, 255, 255), 1 * s))
+            using (var inner = Shapes.RoundRect(RectangleF.Inflate(box, -.5f * s, -.5f * s), radius - .5f * s))
+                g.DrawPath(edge, inner);
+        }
+
+        // 唱盘下面的影子（两层，软一点）
+        for (int i = 0; i < 2; i++)
+        {
+            float grow = (3 + i * 3) * s;
+            using var shadow = new SolidBrush(Color.FromArgb(i == 0 ? 70 : 35, 0, 0, 0));
+            g.FillEllipse(shadow, cx - r - grow / 2, cy - r + 2.5f * s - grow / 2 + i * 2 * s, (r + grow / 2) * 2, (r + grow / 2) * 2);
+        }
+        // 唱盘的金属边：上亮下暗
+        float rim = r + 3 * s;
+        using (var platter = new LinearGradientBrush(new PointF(cx, cy - rim), new PointF(cx, cy + rim), Color.FromArgb(178, 184, 192), Color.FromArgb(48, 51, 56)))
+            g.FillEllipse(platter, cx - rim, cy - rim, rim * 2, rim * 2);
+
+        // 黑胶：中间稍亮、边上更黑
+        using (var disc = new GraphicsPath())
+        {
+            disc.AddEllipse(cx - r, cy - r, r * 2, r * 2);
+            using var vinyl = new PathGradientBrush(disc) { CenterColor = Color.FromArgb(34, 35, 39), SurroundColors = new[] { Color.FromArgb(10, 10, 12) } };
+            g.FillPath(vinyl, disc);
+        }
+        // 沟槽：一圈圈细纹，隔几圈有一道歌与歌之间的空隙（亮一点）
+        int ring = 0;
+        for (float rr = label + 3 * s; rr < r - 1.5f * s; rr += 1.35f * s, ring++)
+        {
+            bool gap = ring % 11 == 6;
+            using var groove = new Pen(Color.FromArgb(gap ? 26 : ring % 2 == 0 ? 11 : 5, 255, 255, 255), (gap ? .9f : .6f) * s);
+            g.DrawEllipse(groove, cx - rr, cy - rr, rr * 2, rr * 2);
+        }
+        using (var lip = new Pen(Color.FromArgb(40, 255, 255, 255), .8f * s)) g.DrawEllipse(lip, cx - r + .5f * s, cy - r + .5f * s, (r - .5f * s) * 2, (r - .5f * s) * 2);
+
+        // 反光：灯在左上方，在唱片上照出两道相对的扇形亮带（真唱片转起来亮带是不动的）
+        var keep = g.Save();
+        using (var ringArea = new GraphicsPath())
+        {
+            ringArea.AddEllipse(cx - r, cy - r, r * 2, r * 2);
+            ringArea.AddEllipse(cx - label - 2 * s, cy - label - 2 * s, (label + 2 * s) * 2, (label + 2 * s) * 2);
+            ringArea.FillMode = FillMode.Alternate;
+            g.SetClip(ringArea, CombineMode.Intersect);
+        }
+        foreach (float centre in new[] { -125f, 55f })
+            for (int k = -7; k <= 7; k++)
+            {
+                float strength = MathF.Exp(-(k * k) / 9f) * (centre < 0 ? 46 : 26);
+                using var band = new SolidBrush(Color.FromArgb((int)strength, 255, 255, 255));
+                g.FillPie(band, cx - r, cy - r, r * 2, r * 2, centre + k * 2.4f - 1.2f, 2.4f);
+            }
+        g.Restore(keep);
+
+        // 唱臂的底座和搁架（不动的部分）
+        var (px, py, _) = ArmGeometry(box, cx, cy, r);
+        float baseR = 10 * s;
+        using (var shadow = new SolidBrush(Color.FromArgb(70, 0, 0, 0))) g.FillEllipse(shadow, px - baseR + 1.5f * s, py - baseR + 2.5f * s, baseR * 2, baseR * 2);
+        using (var plate = new LinearGradientBrush(new PointF(px - baseR, py - baseR), new PointF(px + baseR, py + baseR), Color.FromArgb(150, 156, 165), Color.FromArgb(44, 47, 52)))
+            g.FillEllipse(plate, px - baseR, py - baseR, baseR * 2, baseR * 2);
+        using (var ringPen = new Pen(Color.FromArgb(60, 255, 255, 255), .8f * s)) g.DrawEllipse(ringPen, px - baseR + .5f * s, py - baseR + .5f * s, baseR * 2 - s, baseR * 2 - s);
+        var rest = ArmTip(px, py, ArmGeometry(box, cx, cy, r).Length, ArmRestAngle);
+        float post = 3.2f * s;
+        using (var postBrush = new LinearGradientBrush(new PointF(rest.X - post, rest.Y - post), new PointF(rest.X + post, rest.Y + post), Color.FromArgb(120, 125, 133), Color.FromArgb(36, 38, 42)))
+            g.FillEllipse(postBrush, rest.X - post, rest.Y + 5 * s - post, post * 2, post * 2);
+    }
+
+    const float ArmRestAngle = .07f; // 弧度：搁着时几乎竖直往下
+
+    /// <summary>唱臂转轴在哪、臂多长、落在唱片上时的角度（0 = 竖直往下，往左转是负的）。</summary>
+    (float X, float Y, float Length) ArmGeometry(RectangleF box, float cx, float cy, float r)
+    {
+        float px = box.Right - box.Width * .13f, py = box.Y + box.Height * .17f;
+        float tx = cx + r * .52f, ty = cy + r * .56f; // 唱针落在外圈靠右下
+        return (px, py, MathF.Sqrt((tx - px) * (tx - px) + (ty - py) * (ty - py)));
+    }
+
+    static PointF ArmTip(float px, float py, float length, float angle) => new(px + length * MathF.Sin(angle), py + length * MathF.Cos(angle));
+
+    void DrawTonearm(Graphics g, RectangleF art, float cx, float cy, float r, float a)
+    {
+        float s = S;
+        var (px, py, length) = ArmGeometry(art, cx, cy, r);
+        float tx = cx + r * .52f, ty = cy + r * .56f;
+        float play = MathF.Atan2(tx - px, ty - py);
+        float e = armPos * armPos * (3 - 2 * armPos); // 缓进缓出
+        float angle = ArmRestAngle + (play - ArmRestAngle) * e;
+        // 抬着的时候离唱片高一点：影子离得远、臂也略亮
+        float lift = 1 - e;
+        var tip = ArmTip(px, py, length, angle);
+        var back = ArmTip(px, py, -14 * s, angle); // 转轴另一边的配重
+        float dx = MathF.Sin(angle), dy = MathF.Cos(angle);
+        // 唱头：往里折一点
+        float headAngle = angle + .45f;
+        var head = new PointF(tip.X + 12 * s * MathF.Sin(headAngle), tip.Y + 12 * s * MathF.Cos(headAngle));
+
+        // 影子（往右下偏，抬起来时偏得多）
+        float off = (3 + 3 * lift) * s;
+        using (var shade = new Pen(Color.FromArgb(Byte((.38f - .1f * lift) * a), 0, 0, 0), 4.2f * s) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+            g.DrawLines(shade, new[] { new PointF(back.X + off, back.Y + off), new PointF(tip.X + off, tip.Y + off), new PointF(head.X + off, head.Y + off) });
+
+        // 配重：一截粗圆柱
+        using (var weight = new Pen(Color.FromArgb(Byte(a), 70, 74, 80), 8.5f * s) { StartCap = LineCap.Round, EndCap = LineCap.Flat })
+            g.DrawLine(weight, back, new PointF(px - dx * 6 * s, py - dy * 6 * s));
+        using (var weightHi = new Pen(Color.FromArgb(Byte(.5f * a), 210, 214, 220), 1.6f * s) { StartCap = LineCap.Round })
+            g.DrawLine(weightHi, new PointF(back.X - dy * 2.2f * s, back.Y + dx * 2.2f * s), new PointF(px - dx * 6 * s - dy * 2.2f * s, py - dy * 6 * s + dx * 2.2f * s));
+
+        // 臂管：银色，中间一道高光像圆管
+        using (var tube = new Pen(Color.FromArgb(Byte(a), 168, 174, 183), 3.4f * s) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            g.DrawLine(tube, px, py, tip.X, tip.Y);
+        using (var dark = new Pen(Color.FromArgb(Byte(.45f * a), 40, 42, 46), 1.1f * s))
+            g.DrawLine(dark, px + dy * 1.2f * s, py - dx * 1.2f * s, tip.X + dy * 1.2f * s, tip.Y - dx * 1.2f * s);
+        using (var shine = new Pen(Color.FromArgb(Byte(.9f * a), 246, 248, 251), 1.1f * s))
+            g.DrawLine(shine, px - dy * .8f * s, py + dx * .8f * s, tip.X - dy * .8f * s, tip.Y + dx * .8f * s);
+
+        // 唱头：深色小块 + 一点歌曲颜色的唱针盒
+        var (accent, amount) = Accent();
+        // 唱头壳：深灰金属，上沿一道细高光；唱针盒是暗红（带一点歌曲的颜色），不抢眼
+        float hx = MathF.Sin(headAngle), hy = MathF.Cos(headAngle);
+        using (var shell = new Pen(Color.FromArgb(Byte(a), 58, 61, 67), 7.4f * s) { StartCap = LineCap.Flat, EndCap = LineCap.Flat })
+            g.DrawLine(shell, tip, head);
+        using (var edge = new Pen(Color.FromArgb(Byte(.45f * a), 255, 255, 255), .8f * s))
+            g.DrawLine(edge, tip.X - hy * 3.2f * s, tip.Y + hx * 3.2f * s, head.X - hy * 3.2f * s, head.Y + hx * 3.2f * s);
+        var mid = new PointF(tip.X + hx * 5 * s, tip.Y + hy * 5 * s);
+        using (var cart = new Pen(Color.FromArgb(Byte(a), Mix(Color.FromArgb(120, 36, 32), accent, amount * .35f)), 4.4f * s) { StartCap = LineCap.Flat, EndCap = LineCap.Flat })
+            g.DrawLine(cart, mid, head);
+        using (var finger = new Pen(Color.FromArgb(Byte(a), 150, 155, 163), 1.3f * s) { EndCap = LineCap.Round }) // 拿唱臂用的小指扣
+            g.DrawLine(finger, head.X - hy * 3.5f * s, head.Y + hx * 3.5f * s, head.X - hy * 7 * s, head.Y + hx * 7 * s);
+
+        // 转轴盖：一颗亮的金属钮
+        float cap = 4.6f * s;
+        using (var hub = new LinearGradientBrush(new PointF(px - cap, py - cap), new PointF(px + cap, py + cap), Color.FromArgb(Byte(a), 240, 242, 246), Color.FromArgb(Byte(a), 92, 97, 105)))
+            g.FillEllipse(hub, px - cap, py - cap, cap * 2, cap * 2);
+    }
+
+    /// <summary>滚滚轮调音量时：封面上盖一层暗，中间一个大数字，外面一圈是音量。一秒后淡掉。</summary>
+    void DrawVolumeBubble(Graphics g, RectangleF over, float a)
+    {
+        if (volumeShownSince < 0 || volume < 0) return;
+        float t = (Now - volumeShownSince) / (float)VolumeShowMs;
+        if (t >= 1) return;
+        float s = S, fade = (t < .7f ? 1 : (1 - t) / .3f) * a;
+        var (accent, amount) = Accent();
+        FillRound(g, over, 14 * s, Color.FromArgb(Byte(.5f * fade), 0, 0, 0));
+        float cx = over.X + over.Width / 2, cy = over.Y + over.Height / 2, r = Math.Min(over.Width, over.Height) * .34f;
+        using (var track = new Pen(Color.FromArgb(Byte(.22f * fade), 255, 255, 255), 4 * s)) g.DrawEllipse(track, cx - r, cy - r, r * 2, r * 2);
+        var ring = amount > .05f ? Mix(Color.White, accent, .6f * amount) : Color.White;
+        if (volume > .001f)
+            using (var pen = new Pen(Color.FromArgb(Byte(fade), ring), 4 * s) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                g.DrawArc(pen, cx - r, cy - r, r * 2, r * 2, -90, 360 * volume);
+        using var brush = new SolidBrush(Color.FromArgb(Byte(fade), 255, 255, 255));
+        g.DrawString(((int)Math.Round(volume * 100)).ToString(), volumeFont, brush, new RectangleF(cx - r, cy - r, r * 2, r * 2), CenterFormat);
+    }
+
+    /// <summary>只在放歌时往前走的时钟：背景漂、锁住的光呼吸用。暂停时停住，再放时接着走，不会跳一下。</summary>
+    long driftStamp;
+    float Drift()
+    {
+        long now = Now;
+        if (media is { Playing: true } && animate) drift += Math.Min(.1f, (now - driftStamp) / 1000f);
+        driftStamp = now;
+        return drift;
+    }
+
+    /// <summary>“耳机 (WH-1000XM5)”→“WH-1000XM5”；“扬声器 (Realtek(R) Audio)”→“扬声器”；“耳机 (Realtek(R) Audio)”→“耳机”。</summary>
+    static string DeviceName(Audio.Output device)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(device.Name, @"^(.*?)\s*\((.+)\)\s*$");
+        // 括号里是声卡名（插线耳机“耳机 (Realtek(R) Audio)”）时用前面那半；蓝牙耳机括号里才是耳机自己的名字
+        bool card = m.Success && System.Text.RegularExpressions.Regex.IsMatch(m.Groups[2].Value, @"(?i)realtek|nvidia|intel|amd|high definition|usb audio|audio device|smart sound");
+        string name = !m.Success ? device.Name : device.Headphones && !card ? m.Groups[2].Value : m.Groups[1].Value;
+        name = System.Text.RegularExpressions.Regex.Replace(name, @"(?i)\s+(stereo|hands-free.*|a2dp.*)$", "");
+        return Shorten(name.Trim(), 18);
     }
 
     void DrawLyrics(Graphics g, RectangleF box, TimeSpan position, float a)
     {
         float s = S;
-        string? message = lyricsLoading ? "正在从 lrclib.net 找歌词…"
-            : lyricsOffline ? "歌词服务暂时连不上，下次打开再试"
-            : lyrics == null ? "没有找到这首歌的歌词"
-            : lyrics.Instrumental ? "纯音乐，请欣赏" : null;
+        string? message = lyricsLoading ? (app.Config.NeteaseLyrics ? L.T("正在找歌词…", "Finding lyrics…") : L.T("正在从 lrclib.net 找歌词…", "Finding lyrics on lrclib.net…"))
+            : lyricsOffline ? L.T("歌词服务暂时连不上，下次打开再试", "Lyrics service unreachable, will retry later")
+            : lyrics == null ? L.T("没有找到这首歌的歌词（右键可以手动搜索）", "No lyrics found (right-click to search)")
+            : lyrics.Instrumental ? L.T("纯音乐，请欣赏", "Instrumental, enjoy") : null;
         if (message != null)
         {
             using var brush = new SolidBrush(Ink(.5f * a));
@@ -2360,30 +3356,229 @@ internal sealed class CapsuleWindow : Form
         int index = lyrics.IndexAt(position + TimeSpan.FromMilliseconds(250)); // 早一点点换，跟唱的感觉对得上
         if (index != lyricIndex)
         {
+            // 唱到下一句：整列往上滚一格；拖进度跳过去的就直接换，不滚
+            lyricRollFrom = lyricIndex >= 0 && index == lyricIndex + 1 ? lyricIndex : -1;
             if (lyricIndex >= 0 || index >= 0) lyricSince = Now;
             lyricIndex = index;
         }
-        string current = index >= 0 ? lines[index].Text : "";
-        if (current.Length == 0) current = "♪";
-        string next = "";
-        for (int i = index + 1; i < lines.Length && i <= index + 6; i++)
-            if (lines[i].Text.Length > 0) { next = lines[i].Text; break; }
+        if (lyricPathsFor != lyrics) ClearLyricPaths();
 
-        // 换句：新的一句从下面浮上来、慢慢变亮
-        float t = animate && lyricSince >= 0 ? Math.Clamp((Now - lyricSince) / 300f, 0, 1) : 1;
+        float t = animate && lyricSince >= 0 ? Math.Clamp((Now - lyricSince) / (float)LyricRollMs, 0, 1) : 1;
         float e = 1 - (1 - t) * (1 - t) * (1 - t);
-        float lineH = lyricFont.GetHeight(g), nextLineH = lyricNextFont.GetHeight(g);
-        float curH = Math.Min(g.MeasureString(current, lyricFont, (int)box.Width, WrapFormat).Height, lineH * 3);
-        float nextH = next.Length == 0 ? 0 : Math.Min(g.MeasureString(next, lyricNextFont, (int)box.Width, WrapFormat).Height, nextLineH * 2);
-        float total = curH + (nextH > 0 ? 10 * s + nextH : 0);
-        float top = box.Y + (box.Height - total) / 2 + (1 - e) * 14 * s;
-        using (var brush = new SolidBrush(Ink((.3f + .7f * e) * a)))
-            g.DrawString(current, lyricFont, brush, new RectangleF(box.X, top, box.Width, curH + 1), WrapFormat);
-        if (nextH > 0)
+        // 滚动中：每句的“名次”（0 = 正在唱，-1 = 上一句，1 = 下一句）从旧位置连续地挪到新位置
+        float roll = lyricRollFrom >= 0 ? 1 - e : 0;
+        float fade = lyricRollFrom >= 0 ? 1 : e;
+
+        float big = lyricFont.Size, small = lyricNextFont.Size;
+        float bigH = BoundsOf(LyricPath(index, big, box.Width)).Height;
+        float gap = 12 * s, step = Math.Max(bigH, big) / 2 + gap + small * .7f;
+        float centerY = box.Y + box.Height / 2;
+        var (accent, amount) = Accent();
+        // 翻译：正在唱的那句下面多一行小字，这句和翻译一起居中；滚动时跟着这句的“名次”慢慢让出/收回位置
+        bool translate = app.Config.LyricTranslation;
+        float trH = chipFont.Height + 4 * s;
+        float Extra(int j) => translate && j >= 0 && j < lines.Length && !string.IsNullOrEmpty(lines[j].Translation)
+            ? trH * Math.Clamp(1 - Math.Abs(j - index + roll), 0, 1) : 0;
+        int first = Math.Max(0, index - 2);
+        float extraAll = 0;
+        for (int j = first; j <= index + 2 && j < lines.Length; j++) extraAll += Extra(j);
+        var state = g.Save();
+        g.SetClip(RectangleF.Inflate(box, 8 * s, 2 * s), CombineMode.Intersect);
+        for (int i = first; i <= index + 2 && i < lines.Length; i++)
         {
-            using var brush = new SolidBrush(Ink(.42f * e * a));
-            g.DrawString(next, lyricNextFont, brush, new RectangleF(box.X, top + curH + 10 * s, box.Width, nextH + 1), WrapFormat);
+            if (i < 0) continue;
+            float rank = i - index + roll;
+            if (Math.Abs(rank) > 1.6f) continue;
+            bool empty = lines[i].Text.Trim().Length == 0;
+            if (empty && Math.Abs(rank) > .5f) continue; // 间奏的空行只在正在唱时显示成 ♪
+            float focus = Math.Clamp(1 - Math.Abs(rank), 0, 1);
+            float size = small + (big - small) * focus;
+            var path = LyricPath(i, size, box.Width);
+            var bounds = BoundsOf(path);
+            float above = 0;
+            for (int j = first; j < i; j++) above += Extra(j);
+            float y = centerY + rank * step - bounds.Height / 2 - bounds.Y + above - extraAll / 2;
+            float alpha = a * fade * (rank < 0 ? .34f + .66f * focus : .46f + .54f * focus) * Math.Clamp((1.6f - Math.Abs(rank)) / .6f, 0, 1);
+            using var m = new Matrix();
+            m.Translate(box.X, y);
+            using var placed = (GraphicsPath)path.Clone();
+            placed.Transform(m);
+            // 一句太长折成两行时，第二行从这里开始（路径原点在第一行顶上）
+            float rowH = size * lyricFont.FontFamily.GetLineSpacing(FontStyle.Bold) / lyricFont.FontFamily.GetEmHeight(FontStyle.Bold);
+            float split = bounds.Bottom > rowH * 1.15f ? y + rowH : float.NaN;
+            DrawLyricLine(g, placed, focus, alpha, i, position, accent, amount, split);
+            if (Extra(i) > .5f)
+            {
+                string said = Fit(lines[i].Translation!, chipFont, box.Width);
+                using var trBrush = new SolidBrush(Ink(alpha * focus * .72f));
+                g.DrawString(said, chipFont, trBrush, box.X, y + bounds.Bottom + 3 * s);
+            }
         }
+        g.Restore(state);
+    }
+
+    const int LyricRollMs = 420;
+
+    /// <summary>
+    /// 一句歌词：正在唱的那句有一层往下的柔影和一圈歌曲颜色的光晕，唱过的部分从左往右亮起来（卡拉 OK）；
+    /// 上一句、下一句只是淡淡的字。
+    /// </summary>
+    void DrawLyricLine(Graphics g, GraphicsPath path, float focus, float alpha, int line, TimeSpan position, Color accent, float amount, float split = float.NaN)
+    {
+        float s = S;
+        bool dark = DarkInk;
+        // 影子：往下错开一点的深色字，再淡一点的一层更远，像浮在玻璃上
+        using (var m = new Matrix())
+        {
+            m.Translate(0, 2.2f * s);
+            using var shadow = (GraphicsPath)path.Clone();
+            shadow.Transform(m);
+            using var brush = new SolidBrush(Color.FromArgb(Byte((dark ? .10f : .38f) * alpha), 0, 0, 0));
+            g.FillPath(brush, shadow);
+        }
+        if (focus > .05f)
+        {
+            // 光晕：几圈越来越宽、越来越淡的描边，颜色跟着歌（没有歌色时是白光）
+            var glow = amount > .05f ? Mix(Color.White, accent, .55f * amount) : Color.White;
+            foreach (var (width, k) in new[] { (9f, .05f), (6f, .08f), (3.5f, .12f) })
+            {
+                using var pen = new Pen(Color.FromArgb(Byte(k * focus * alpha * (dark ? .6f : 1)), glow), width * s) { LineJoin = LineJoin.Round };
+                g.DrawPath(pen, path);
+            }
+        }
+        var bounds = path.GetBounds();
+        float sung = focus > .5f ? SungFraction(line, position) : line < lyricIndex ? 1 : 0;
+        if (focus > .05f && sung < .999f && bounds.Width > 1)
+        {
+            // 卡拉 OK：唱到哪亮到哪，交界处软一点。折成两行的：先亮完第一行，再从第二行开头接着亮
+            float p = Math.Clamp(sung, 0, 1);
+            if (!float.IsNaN(split) && RowSpans(path, split) is var (top, bottom) && top.Width > 1 && bottom.Width > 1)
+            {
+                float filled = p * (top.Width + bottom.Width);
+                var state = g.Save();
+                g.SetClip(new RectangleF(bounds.X - 20 * s, bounds.Y - 20 * s, bounds.Width + 40 * s, split - bounds.Y + 20 * s), CombineMode.Intersect);
+                FillSung(g, path, top, filled / top.Width, alpha);
+                g.Restore(state);
+                state = g.Save();
+                g.SetClip(new RectangleF(bounds.X - 20 * s, split, bounds.Width + 40 * s, bounds.Bottom - split + 20 * s), CombineMode.Intersect);
+                FillSung(g, path, bottom, (filled - top.Width) / bottom.Width, alpha);
+                g.Restore(state);
+            }
+            else FillSung(g, path, bounds, p, alpha);
+        }
+        else
+        {
+            using var brush = new SolidBrush(Ink(alpha));
+            g.FillPath(brush, path);
+        }
+    }
+
+    /// <summary>在 span 这一段（一行字的左右）里，从左数 p 成亮、其余暗。</summary>
+    void FillSung(Graphics g, GraphicsPath path, RectangleF span, float p, float alpha)
+    {
+        p = Math.Clamp(p, 0, 1);
+        var bright = Ink(alpha);
+        var dim = Ink(alpha * .5f);
+        if (p <= 0 || p >= 1)
+        {
+            using var solid = new SolidBrush(p >= 1 ? bright : dim);
+            g.FillPath(solid, path);
+            return;
+        }
+        using var brush = new LinearGradientBrush(new RectangleF(span.X - 1, span.Y, span.Width + 2, Math.Max(1, span.Height)), bright, dim, LinearGradientMode.Horizontal);
+        float edge = .06f;
+        brush.InterpolationColors = new ColorBlend
+        {
+            Colors = new[] { bright, bright, dim, dim },
+            Positions = new[] { 0f, Math.Clamp(p - edge, 0, 1), Math.Clamp(p + edge, 0.0001f, 1), 1f },
+        };
+        if (brush.InterpolationColors.Positions[1] >= brush.InterpolationColors.Positions[2])
+            brush.InterpolationColors = new ColorBlend { Colors = new[] { bright, dim }, Positions = new[] { 0f, 1f } };
+        brush.WrapMode = WrapMode.TileFlipX; // 渐变框外（光晕边）别重复出亮条
+        g.FillPath(brush, path);
+    }
+
+    /// <summary>折成两行的歌词：第一行、第二行各自的左右范围（按字形的点算）。</summary>
+    static (RectangleF Top, RectangleF Bottom)? RowSpans(GraphicsPath path, float split)
+    {
+        var points = path.PathPoints;
+        float t0 = float.MaxValue, t1 = float.MinValue, b0 = float.MaxValue, b1 = float.MinValue;
+        float ty0 = float.MaxValue, ty1 = float.MinValue, by0 = float.MaxValue, by1 = float.MinValue;
+        foreach (var pt in points)
+        {
+            if (pt.Y < split)
+            {
+                t0 = Math.Min(t0, pt.X); t1 = Math.Max(t1, pt.X); ty0 = Math.Min(ty0, pt.Y); ty1 = Math.Max(ty1, pt.Y);
+            }
+            else
+            {
+                b0 = Math.Min(b0, pt.X); b1 = Math.Max(b1, pt.X); by0 = Math.Min(by0, pt.Y); by1 = Math.Max(by1, pt.Y);
+            }
+        }
+        if (t1 < t0 || b1 < b0) return null;
+        return (new RectangleF(t0, ty0, t1 - t0, ty1 - ty0), new RectangleF(b0, by0, b1 - b0, by1 - by0));
+    }
+
+    /// <summary>
+    /// 这一句唱了几成（按字宽算）：有逐字时间的（网易云）唱到哪个字亮到哪个字；
+    /// 没有的按到下一句的时间算（太长的间隔按字数估，免得一句话要亮好久）。
+    /// </summary>
+    float SungFraction(int line, TimeSpan position)
+    {
+        var lines = lyrics?.Lines;
+        if (lines == null || line < 0 || line >= lines.Length) return 1;
+        if (lines[line].Words is { Length: > 0 } words)
+        {
+            var now = position + TimeSpan.FromMilliseconds(120);
+            string done = "";
+            foreach (var word in words)
+            {
+                if (now >= word.Start + word.Length)
+                {
+                    done += word.Text;
+                    continue;
+                }
+                float full = Measure(lines[line].Text, lyricFont);
+                if (full <= 0) return 1;
+                float part = now > word.Start ? (float)((now - word.Start).TotalMilliseconds / Math.Max(1, word.Length.TotalMilliseconds)) : 0;
+                return Math.Clamp((Measure(done.TrimStart(), lyricFont) + part * Measure(word.Text, lyricFont)) / full, 0, 1);
+            }
+            return 1;
+        }
+        var start = lines[line].Time;
+        double span = line + 1 < lines.Length ? (lines[line + 1].Time - start).TotalSeconds : 4;
+        span = Math.Clamp(Math.Min(span, .32 * lines[line].Text.Length + .8), .4, 12);
+        return (float)Math.Clamp((position + TimeSpan.FromMilliseconds(250) - start).TotalSeconds / span, 0, 1);
+    }
+
+    /// <summary>一句歌词的字形（原点在左上），同一句同一字号只做一次。</summary>
+    GraphicsPath LyricPath(int line, float size, float width)
+    {
+        var key = (line, (int)Math.Round(size * 4), (int)width);
+        if (lyricPaths.TryGetValue(key, out var path)) return path;
+        if (lyricPaths.Count > 40) ClearLyricPaths(keepOwner: true);
+        string text = lyrics != null && line >= 0 && line < lyrics.Lines.Length ? lyrics.Lines[line].Text.Trim() : "";
+        if (text.Length == 0) text = "♪";
+        path = new GraphicsPath();
+        // 最多两行；太长的截掉
+        bool focusSize = size > (lyricFont.Size + lyricNextFont.Size) / 2;
+        if (!focusSize) text = Fit(text, lyricNextFont, width * lyricNextFont.Size / Math.Max(1, size));
+        using var format = new StringFormat(focusSize ? StringFormatFlags.LineLimit : StringFormatFlags.NoWrap) { Trimming = StringTrimming.EllipsisWord };
+        path.AddString(text, lyricFont.FontFamily, (int)FontStyle.Bold, size, new RectangleF(0, 0, width, size * (focusSize ? 2.7f : 1.4f)), format);
+        return lyricPaths[key] = path;
+    }
+
+    static RectangleF BoundsOf(GraphicsPath path)
+    {
+        var b = path.GetBounds();
+        return b.IsEmpty ? new RectangleF(0, 0, 1, 1) : b;
+    }
+
+    void ClearLyricPaths(bool keepOwner = false)
+    {
+        foreach (var path in lyricPaths.Values) path.Dispose();
+        lyricPaths.Clear();
+        if (!keepOwner) lyricPathsFor = lyrics;
     }
 
     float MusicChip(Graphics g, float x, float cy, string text, string key, int value, bool on, Point mouse, float a, float limit)
@@ -2394,6 +3589,61 @@ internal sealed class CapsuleWindow : Form
         FillRound(g, b, h / 2, on ? Ink(.9f * a) : b.Contains(mouse) ? Ink(.18f * a) : Ink(.09f * a));
         DrawTight(g, text, chipFont, on ? Deep(a) : Ink(.82f * a), b.X + 11 * s, cy);
         musicHits.Add((b, key, value));
+        return w;
+    }
+
+    /// <summary>小锁：锁着时锁梁扣下去，开着时往上翘、左脚离开锁身。</summary>
+    void DrawLock(Graphics g, float cx, float cy, bool closed, Color color)
+    {
+        float s = S;
+        FillRound(g, new RectangleF(cx - 5.5f * s, cy - 1 * s, 11 * s, 8.5f * s), 2 * s, color);
+        using var pen = new Pen(color, 1.7f * s) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        float lift = closed ? 0 : 2.6f * s, top = cy - 8 * s - lift;
+        g.DrawArc(pen, cx - 3.6f * s, top, 7.2f * s, 7.2f * s, 180, 180);
+        g.DrawLine(pen, cx + 3.6f * s, top + 3.6f * s, cx + 3.6f * s, cy - 1 * s);
+        g.DrawLine(pen, cx - 3.6f * s, top + 3.6f * s, cx - 3.6f * s, closed ? cy - 1 * s : top + 4.6f * s);
+    }
+
+    /// <summary>跳过：一个小三角加一竖。</summary>
+    void DrawSkip(Graphics g, float x, float cy, Color color)
+    {
+        float s = S;
+        using var brush = new SolidBrush(color);
+        Triangle(g, brush, x - 3 * s, cy, 1, 5.5f * s);
+        g.FillRectangle(brush, x + 3.2f * s, cy - 4.5f * s, 1.8f * s, 9 * s);
+    }
+
+    /// <summary>头戴耳机：一道弧加两个耳罩，left 是左边缘，16px 宽。</summary>
+    void DrawHeadphones(Graphics g, float left, float cy, Color ink)
+    {
+        float s = S;
+        using (var pen = new Pen(ink, 1.6f * s) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            g.DrawArc(pen, left + 1.5f * s, cy - 7 * s, 13 * s, 12 * s, 180, 180);
+        FillRound(g, new RectangleF(left, cy - 1 * s, 4.5f * s, 7.5f * s), 1.8f * s, ink);
+        FillRound(g, new RectangleF(left + 11.5f * s, cy - 1 * s, 4.5f * s, 7.5f * s), 1.8f * s, ink);
+    }
+
+    /// <summary>右对齐画在 right 左边：耳机图标、名字、电量（20% 以下变红）。返回用掉的宽度，放不下返回 0。</summary>
+    float DrawEarbuds(Graphics g, float right, float cy, string name, int percent, float minLeft, float a)
+    {
+        float s = S;
+        string pct = $"{percent}%";
+        float pctW = Measure(pct, boldFont) * s;
+        string label = Fit(name, smallFont, 96 * s);
+        float labelW = Measure(label, smallFont) * s;
+        float w = 16 * s + 6 * s + labelW + 6 * s + pctW;
+        if (right - w < minLeft) { label = ""; w = 16 * s + 6 * s + pctW; } // 地方不够：只留图标和电量
+        if (right - w < minLeft) return 0;
+        float x = right - w;
+        DrawHeadphones(g, x, cy, Ink(.82f * a));
+        x += 22 * s;
+        if (label.Length > 0)
+        {
+            DrawTight(g, label, smallFont, Ink(.62f * a), x, cy);
+            x += labelW + 6 * s;
+        }
+        var color = percent <= 20 ? Color.FromArgb(Byte(a), 248, 113, 113) : Ink(.92f * a);
+        DrawTight(g, pct, boldFont, color, x, cy);
         return w;
     }
 
@@ -2500,10 +3750,10 @@ internal sealed class CapsuleWindow : Form
             "msedge" => "Edge",
             "308046b0af4a39cb" or "firefox" => "Firefox",
             "spotify" => "Spotify",
-            "cloudmusic" => "网易云音乐",
-            "qqmusic" => "QQ音乐",
-            "kugou" => "酷狗",
-            "microsoft.zunemusic" => "媒体播放器",
+            "cloudmusic" => L.T("网易云音乐", "NetEase Cloud Music"),
+            "qqmusic" => L.T("QQ音乐", "QQ Music"),
+            "kugou" => L.T("酷狗", "Kugou"),
+            "microsoft.zunemusic" => L.T("媒体播放器", "Media Player"),
             "applemusic" or "appleinc.applemusicwin" => "Apple Music",
             _ => Shorten(name.Length > 0 ? char.ToUpperInvariant(name[0]) + name[1..] : id, 14),
         };
@@ -2544,10 +3794,541 @@ internal sealed class CapsuleWindow : Form
                 case "files":
                     SetMode(Mode.Open);
                     break;
+                case "lock": ToggleLock(); break;
+                case "skipad":
+                    SkipAd();
+                    break;
+                case "output":
+                    menuOpen = true;
+                    try { ShowOutputMenu(PointToScreen(new Point((int)rect.X, (int)rect.Bottom + 4))); }
+                    finally { menuOpen = false; }
+                    break;
             }
             Redraw();
             return;
         }
+        // 空白处：双击锁住 / 解开；按住往下拖（开了的话）把卡片拖出来放到桌面上
+        var dbl = SystemInformation.DoubleClickSize;
+        if (lastCardClick >= 0 && Now - lastCardClick <= SystemInformation.DoubleClickTime
+            && Math.Abs(p.X - lastCardClickAt.X) <= dbl.Width && Math.Abs(p.Y - lastCardClickAt.Y) <= dbl.Height)
+        {
+            lastCardClick = -1;
+            ToggleLock();
+            return;
+        }
+        lastCardClick = Now;
+        lastCardClickAt = p;
+        cardPressed = true;
+        cardPressAt = p;
+    }
+
+    void ToggleLock()
+    {
+        musicPinned = !musicPinned;
+        musicHoldUntil = 0; // 解开后照常：鼠标不在旁边就收起
+        if (musicPinned) ripple = Now; // 锁上时一圈光扩散出去
+        Redraw();
+    }
+
+    // ---------- 右键菜单：锁住、放到桌面、歌词、输出设备 ----------
+
+    void ShowMusicMenu(Point at)
+    {
+        using var menu = new PopupMenu();
+        menu.Add(L.T("锁住卡片（不自动收起）", "Lock card (don't auto-close)"), ToggleLock, check: musicPinned);
+        if (app.Config.MusicFloat) menu.Add(L.T("放到桌面上（小播放器）", "Put on desktop (mini player)"), DetachToDesktop);
+        AddLyricItems(menu);
+        if (app.Config.OutputSwitch) AddOutputItems(menu.Sub(L.T("声音输出到", "Play sound through")));
+        menu.Show(at, app.MenuOwner);
+    }
+
+    void AddLyricItems(PopupMenu menu)
+    {
+        if (!app.Config.Lyrics || media == null) return;
+        menu.Separator();
+        var l = lyrics;
+        if (l is { Instrumental: false, Lines.Length: > 0 })
+        {
+            string from = L.Source(l.Source) + (l.Lines.Any(x => x.Words != null) ? L.T(" · 逐字", " · word-by-word") : "") + (l.Choices > 1 ? L.T($" · 第 {l.Choice + 1}/{l.Choices} 个", $" · {l.Choice + 1} of {l.Choices}") : "");
+            menu.Add(L.T("歌词来自 ", "Lyrics from ") + from, () => { }, enabled: false);
+        }
+        menu.Add(L.T("换一个版本的歌词", "Try another version"), () => RefindLyrics((l?.Choices > 0 ? l.Choice : 0) + 1, null), enabled: !lyricsLoading);
+        menu.Add(L.T("手动搜索歌词…", "Search lyrics…"), () =>
+        {
+            if (media == null) return;
+            var (title, artist) = Pretty(media);
+            string? text = InputDialog.Show(L.T("搜索歌词（歌名 歌手）", "Search lyrics (title artist)"), (title + " " + artist).Trim(), Cursor.Position);
+            if (!string.IsNullOrWhiteSpace(text)) RefindLyrics(0, text);
+        }, enabled: !lyricsLoading);
+        if (l is { Instrumental: false, Lines.Length: > 0 })
+        {
+            menu.Add(L.T("歌词提早 0.5 秒", "Lyrics 0.5s earlier"), () => ShiftLyrics(-500));
+            menu.Add(L.T("歌词延后 0.5 秒", "Lyrics 0.5s later"), () => ShiftLyrics(500));
+            // 开头对得上、越往后越对不上：歌词那边的版本快慢跟这首不一样，整首拉长或压短一点
+            menu.Add(L.T("歌词越唱越快了（放慢 2%）", "Lyrics drift ahead (slow down 2%)"), () => StretchLyrics(1.02));
+            menu.Add(L.T("歌词越唱越慢了（加快 2%）", "Lyrics drift behind (speed up 2%)"), () => StretchLyrics(1 / 1.02));
+            if (l.OffsetMs != 0 || Math.Abs(l.Scale - 1) > .001)
+            {
+                var parts = new List<string>();
+                if (l.OffsetMs != 0) parts.Add(L.T($"{l.OffsetMs / 1000.0:+0.0;-0.0} 秒", $"{l.OffsetMs / 1000.0:+0.0;-0.0}s"));
+                if (Math.Abs(l.Scale - 1) > .001) parts.Add(l.Scale > 1 ? L.T($"放慢 {(l.Scale - 1) * 100:0}%", $"slowed {(l.Scale - 1) * 100:0}%") : L.T($"加快 {(1 - l.Scale) * 100:0}%", $"sped up {(1 - l.Scale) * 100:0}%"));
+                menu.Add(L.T($"还原歌词时间（现在 {string.Join("、", parts)}）", $"Reset lyric timing (now {string.Join(", ", parts)})"), () =>
+                {
+                    if (lyrics == null || media == null) return;
+                    lyrics = lyrics.Stretched(1 / lyrics.Scale).Shifted(-lyrics.OffsetMs);
+                    LyricsSource.SaveScale(media.Title, media.Artist, 1);
+                    LyricsSource.SaveOffset(media.Title, media.Artist, 0);
+                    LyricsChangedByHand();
+                });
+            }
+        }
+    }
+
+    /// <summary>歌词整首拉长（&gt;1）或压短一点，记在缓存里。</summary>
+    void StretchLyrics(double factor)
+    {
+        if (lyrics == null || media == null) return;
+        lyrics = lyrics.Stretched(factor);
+        LyricsSource.SaveScale(media.Title, media.Artist, lyrics.Scale);
+        LyricsChangedByHand();
+    }
+
+    void LyricsChangedByHand()
+    {
+        ClearLyricPaths();
+        lyricIndex = pillLyricIndex = -1;
+        BuildPill();
+        UpdateFloat();
+        Redraw();
+    }
+
+    /// <summary>歌词对不上（MV 有片头）：整首往前或往后挪，记在缓存里，下次还是对的。</summary>
+    void ShiftLyrics(int ms)
+    {
+        if (lyrics == null || media == null) return;
+        lyrics = lyrics.Shifted(ms);
+        LyricsSource.SaveOffset(media.Title, media.Artist, lyrics.OffsetMs);
+        ClearLyricPaths();
+        lyricIndex = pillLyricIndex = -1;
+        BuildPill();
+        UpdateFloat();
+        Redraw();
+    }
+
+    void ShowOutputMenu(Point at)
+    {
+        using var menu = new PopupMenu();
+        AddOutputItems(menu);
+        if (menu.Count > 0) menu.Show(at, app.MenuOwner);
+    }
+
+    /// <summary>所有能用的输出设备，现在用的那个打勾；点一个就换过去（跟在 Windows 声音设置里选一样）。</summary>
+    void AddOutputItems(PopupMenu menu)
+    {
+        string current = Audio.DefaultOutput()?.Id ?? "";
+        foreach (var o in Audio.Outputs())
+        {
+            string id = o.Id;
+            menu.Add(o.Name, () =>
+            {
+                if (!Audio.SetDefaultOutput(id)) Log.Info("切换输出设备失败");
+                ReadVolume();
+                Redraw();
+            }, check: id == current);
+        }
+    }
+
+    // ---------- 桌面上的小播放器（从卡片里拖出来的） ----------
+
+    public bool FloatShouldShow => floatWin != null && media != null;
+    public bool FloatLive => media is { Playing: true };
+
+    void OpenFloat(Point topLeft)
+    {
+        if (floatWin != null)
+        {
+            floatWin.MoveCard(topLeft);
+            return;
+        }
+        floatWin = new MusicFloat(this, topLeft);
+        floatWin.Show();
+        EnsureLyrics();
+        UpdateFloat();
+    }
+
+    void CloseFloat()
+    {
+        if (floatWin == null) return;
+        var closing = floatWin;
+        floatWin = null;
+        closing.Close(); // 非模态窗口关掉时自己会 Dispose
+        floatBackdrop.Clear();
+    }
+
+    /// <summary>歌、歌词、播放状态变了：小播放器跟着重画；没在放东西时藏起来。</summary>
+    void UpdateFloat()
+    {
+        if (floatWin == null) return;
+        if (!FloatShouldShow)
+        {
+            if (floatWin.Visible) floatWin.Hide();
+            return;
+        }
+        if (!floatWin.Visible && !FullscreenBusy()) floatWin.Show();
+        floatWin.Repaint(FloatLive);
+    }
+
+    /// <summary>右键“放到桌面上”：放回上次的位置（第一次放在屏幕右下角）。</summary>
+    void DetachToDesktop()
+    {
+        float s = S;
+        var size = new Size((int)(MusicFloat.CardW * s), (int)(MusicFloat.CardH * s));
+        var pos = new Point(app.Config.MusicFloatX, app.Config.MusicFloatY);
+        if (pos.X == int.MinValue || !Screen.AllScreens.Any(sc => sc.WorkingArea.IntersectsWith(new Rectangle(pos, size))))
+            pos = new Point(Area.Right - size.Width - (int)(28 * s), Area.Bottom - size.Height - (int)(28 * s));
+        musicPinned = false;
+        OpenFloat(pos);
+        SetMode(downloadName != null ? Mode.Notify : Mode.Idle);
+    }
+
+    /// <summary>在卡片空白处按住往下拖：卡片“拎”下来缩成小播放器，跟着鼠标走，松手就放在那。</summary>
+    void BeginDetach(Point local)
+    {
+        cardPressed = false;
+        var c = CapsuleRect;
+        float s = S, fw = MusicFloat.CardW * s, fh = MusicFloat.CardH * s;
+        detachGrab = new Point((int)(Math.Clamp((local.X - c.X) / c.Width, .1f, .9f) * fw), (int)(Math.Clamp((local.Y - c.Y) / c.Height, .2f, .8f) * fh));
+        var at = Cursor.Position;
+        musicPinned = false;
+        detaching = true;
+        OpenFloat(new Point(at.X - detachGrab.X, at.Y - detachGrab.Y));
+        SetMode(downloadName != null ? Mode.Notify : Mode.Idle);
+        Capture = true;
+    }
+
+    void EndDetach()
+    {
+        if (!detaching) return;
+        detaching = false;
+        Capture = false;
+        FloatMoved(released: true);
+    }
+
+    /// <summary>小播放器被拖了：松手时拖回屏幕顶上胶囊附近就收回胶囊；拖出屏幕的拉回来一点；记住位置。</summary>
+    public void FloatMoved(bool released)
+    {
+        if (floatWin == null || !released) return;
+        var card = floatWin.CardOnScreen;
+        var screen = Screen.FromRectangle(card);
+        float cx = capsuleOnScreen.X + capsuleOnScreen.Width / 2;
+        if (card.Top < screen.Bounds.Top + 24 * S && Math.Abs(card.X + card.Width / 2 - cx) < 280 * S)
+        {
+            CloseFloat();
+            ShowMusic();
+            return;
+        }
+        var area = screen.WorkingArea;
+        int x = Math.Clamp(card.X, area.Left - card.Width / 2, area.Right - card.Width / 2);
+        int y = Math.Clamp(card.Y, area.Top, area.Bottom - card.Height / 2);
+        if (x != card.X || y != card.Y) floatWin.MoveCard(new Point(x, y));
+        app.Config.MusicFloatX = x;
+        app.Config.MusicFloatY = y;
+        app.ScheduleSave();
+    }
+
+    public void FloatMenu(Point at)
+    {
+        using var menu = new PopupMenu();
+        menu.Add(L.T("收回胶囊", "Back to capsule"), () =>
+        {
+            CloseFloat();
+            ShowMusic();
+        });
+        AddLyricItems(menu);
+        if (app.Config.OutputSwitch) AddOutputItems(menu.Sub(L.T("声音输出到", "Play sound through")));
+        menu.Separator();
+        menu.Add(L.T("关掉小播放器", "Close mini player"), CloseFloat);
+        menu.Show(at, app.MenuOwner);
+    }
+
+    public void FloatWheel(int delta)
+    {
+        if (media == null) return;
+        if (volume < 0) ReadVolume();
+        if (volume < 0) return;
+        volume = Math.Clamp(volume + delta / 120f * .05f, 0, 1);
+        Audio.SetVolume(media.Source, volume, volumePerApp);
+        volumeRead = Now;
+        volumeShownSince = Now;
+        floatWin?.Animate(VolumeShowMs + 60);
+    }
+
+    public bool FloatMouseDown(Point p)
+    {
+        foreach (var (rect, key, _) in floatHits)
+        {
+            if (!rect.Contains(p)) continue;
+            var np = media;
+            switch (key)
+            {
+                case "prev": app.Media?.Send(MediaWatcher.Command.Previous); break;
+                case "next": app.Media?.Send(MediaWatcher.Command.Next); break;
+                case "play":
+                    app.Media?.Send(MediaWatcher.Command.TogglePlay);
+                    if (np != null) media = np with { Playing = !np.Playing, Position = np.CurrentPosition, UpdatedUtc = DateTime.UtcNow };
+                    break;
+                case "skipad":
+                    SkipAd();
+                    break;
+            }
+            UpdateFloat();
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 小播放器的样子：深色底（开了模糊封面就是封面），左边封面（鼠标过来时盖上 上一首/播放/下一首），
+    /// 右边歌名一小行、底下三行歌词（没有歌词就是大歌名），最底下一条细细的进度。字一律白色。
+    /// </summary>
+    public void PaintFloat(Graphics g, RectangleF card, Point mouse, bool hover)
+    {
+        floatHits.Clear();
+        var np = media;
+        float s = S, radius = 22 * s;
+        var (accent, amount) = Accent();
+        using var shape = Shapes.RoundRect(card, radius);
+        var state = g.Save();
+        g.SetClip(shape, CombineMode.Intersect);
+        lightInk = true;
+        try
+        {
+            var cover = np?.Cover ?? np?.Art;
+            Fill(g, card, Color.FromArgb(238, Mix(app.Tone.Tint, Color.Black, .74f)));
+            if (cover != null && app.Config.MusicBackdrop) floatBackdrop.Draw(g, card, card.Size, cover, Drift(), 1);
+            else if (amount > .01f) EllipseGlow(g, new PointF(card.X + 70 * s, card.Y + card.Height / 2), 250 * s, 120 * s, Color.FromArgb(Byte(.5f * amount), accent), card);
+            if (np == null) return;
+
+            var art = new RectangleF(card.X + 16 * s, card.Y + 16 * s, card.Height - 32 * s, card.Height - 32 * s);
+            DrawArt(g, art, np, cover, 1);
+            if (hover)
+            {
+                FillRound(g, art, 14 * s, Color.FromArgb(130, 0, 0, 0));
+                float by = art.Y + art.Height / 2, slot = art.Width / 3;
+                using var brush = new SolidBrush(Color.White);
+                for (int i = 0; i < 3; i++)
+                {
+                    var b = new RectangleF(art.X + slot * i, art.Y, slot, art.Height);
+                    float cx = b.X + b.Width / 2;
+                    if (b.Contains(mouse)) FillRound(g, new RectangleF(cx - 13 * s, by - 13 * s, 26 * s, 26 * s), 13 * s, Color.FromArgb(55, 255, 255, 255));
+                    switch (i)
+                    {
+                        case 0: Triangle(g, brush, cx + 2.5f * s, by, -1, 6 * s); g.FillRectangle(brush, cx - 6 * s, by - 5 * s, 1.8f * s, 10 * s); break;
+                        case 1:
+                            if (np.Playing)
+                            {
+                                FillRound(g, new RectangleF(cx - 5 * s, by - 7 * s, 3.5f * s, 14 * s), 1.4f * s, Color.White);
+                                FillRound(g, new RectangleF(cx + 1.5f * s, by - 7 * s, 3.5f * s, 14 * s), 1.4f * s, Color.White);
+                            }
+                            else Triangle(g, brush, cx - 2 * s, by, 1, 8 * s);
+                            break;
+                        case 2: Triangle(g, brush, cx - 2.5f * s, by, 1, 6 * s); g.FillRectangle(brush, cx + 4.2f * s, by - 5 * s, 1.8f * s, 10 * s); break;
+                    }
+                    floatHits.Add((b, i == 0 ? "prev" : i == 1 ? "play" : "next", 0));
+                }
+            }
+
+            float x0 = art.Right + 18 * s, w = card.Right - 18 * s - x0;
+            var (title, artist) = Pretty(np);
+            var position = np.CurrentPosition;
+            if (adSkippable)
+            {
+                // 能跳过广告：右上角一颗亮着的小按钮
+                string skip = L.T("跳过广告", "Skip ad");
+                float kw = Measure(skip, chipFont) * s + 36 * s;
+                var kb = new RectangleF(card.Right - 14 * s - kw, card.Y + 10 * s, kw, 24 * s);
+                FillRound(g, kb, 12 * s, Color.FromArgb(235, 255, 255, 255));
+                DrawSkip(g, kb.X + 15 * s, kb.Y + kb.Height / 2, Deep(1));
+                DrawTight(g, skip, chipFont, Deep(1), kb.X + 26 * s, kb.Y + kb.Height / 2);
+                floatHits.Add((kb, "skipad", 0));
+            }
+            if (app.Config.Lyrics && lyrics is { Instrumental: false, Lines.Length: > 0 })
+            {
+                DrawTight(g, Fit(artist.Length > 0 ? $"{title} · {artist}" : title, smallFont, adSkippable ? w - 110 * s : w), smallFont, Ink(.6f), x0, card.Y + 22 * s);
+                DrawLyrics(g, new RectangleF(x0, card.Y + 32 * s, w, card.Height - 48 * s), position, 1);
+            }
+            else
+            {
+                DrawTight(g, Fit(title, titleFont, w), titleFont, Ink(1), x0, card.Y + 46 * s);
+                string under = app.Config.Lyrics && lyricsLoading ? L.T("正在找歌词…", "Finding lyrics…") : artist;
+                if (under.Length > 0) DrawTight(g, Fit(under, labelFont, w), labelFont, Ink(.62f), x0, card.Y + 72 * s);
+            }
+            if (np.Duration > TimeSpan.Zero)
+            {
+                // 进度：底边一条细线，唱过的部分是歌的颜色
+                var track = new RectangleF(x0, card.Bottom - 10 * s, w, 3 * s);
+                float progress = (float)Math.Clamp(position.TotalSeconds / np.Duration.TotalSeconds, 0, 1);
+                FillRound(g, track, track.Height / 2, Ink(.16f));
+                FillRound(g, new RectangleF(track.X, track.Y, Math.Max(track.Height, track.Width * progress), track.Height), track.Height / 2,
+                    Color.FromArgb(235, Mix(Color.White, Mix(accent, Color.White, .2f), amount)));
+            }
+            DrawVolumeBubble(g, art, 1);
+        }
+        finally
+        {
+            lightInk = false;
+            g.Restore(state);
+        }
+        using var edge = new Pen(Color.FromArgb(50, 255, 255, 255), 1.2f * s);
+        using var outline = Shapes.RoundRect(RectangleF.Inflate(card, -.6f * s, -.6f * s), radius - .6f * s);
+        g.DrawPath(edge, outline);
+        if (amount > .01f)
+        {
+            using var tint = new Pen(Color.FromArgb(Byte(.4f * amount), Mix(accent, Color.White, .3f)), 1.2f * s);
+            g.DrawPath(tint, outline);
+        }
+    }
+
+    // ---------- YouTube 广告 ----------
+
+    /// <summary>开着“跳过广告”、浏览器在放东西：后台去看；不然让它睡着。</summary>
+    void UpdateAds()
+    {
+        if ((app.Config.SkipAds || app.Config.KeepWatching) && adBridge == null && !adBridgeFailed)
+        {
+            adBridge = AdBridge.Start();
+            adBridgeFailed = adBridge == null;
+            if (adBridge != null)
+            {
+                adBridge.Changed += found => Post(() => OnAdChanged(found, fromExtension: true));
+                adBridge.Skipped += () => Post(() => OnAdSkipped(fromExtension: true));
+                adBridge.Connected += () => Post(() =>
+                {
+                    UpdateAds();
+                    // Edge 里还是旧版扩展：提醒一次去点“重新加载”
+                    if (adBridge?.Outdated == true && !adOutdatedShown && !Focusing && mode == Mode.Idle)
+                    {
+                        adOutdatedShown = true;
+                        ShowAdNote(L.T("Edge 扩展要重新加载：⚙ → 歌词与广告", "Reload the Edge extension: ⚙ → Lyrics & ads"), chip: false, ms: 6000);
+                    }
+                    Redraw();
+                });
+                adBridge.Failed += () => Post(() => OnAdChanged(true, fromExtension: true));
+            }
+        }
+        if (adBridge != null)
+        {
+            adBridge.AutoSkip = app.Config.AutoSkipAds;
+            adBridge.SkipAds = app.Config.SkipAds;
+            adBridge.KeepWatching = app.Config.KeepWatching;
+        }
+        // 扩展来过就交给它（后台标签页也看得到）；老办法停下，省得两边一起按
+        bool want = app.Config.SkipAds && adBridge?.Working != true && media is { Playing: true } np && IsBrowser(np.Source);
+        if (want && ads == null)
+        {
+            ads = new AdSkipper();
+            ads.Changed += found => Post(() => OnAdChanged(found, fromExtension: false));
+            ads.Skipped += () => Post(() => OnAdSkipped(fromExtension: false));
+        }
+        if (ads == null) return;
+        ads.AutoSkip = app.Config.AutoSkipAds;
+        ads.SetActive(want);
+    }
+
+    void Post(Action action)
+    {
+        try { if (IsHandleCreated && !IsDisposed) BeginInvoke(action); }
+        catch (InvalidOperationException) { } // 正在退出
+    }
+
+    /// <summary>
+    /// 自带的 Edge 扩展只能由用户自己在 Edge 里加载（浏览器不让别的程序替你装）：
+    /// 把文件夹路径复制好、打开 Edge 的扩展页，再告诉一步步怎么点。
+    /// </summary>
+    void InstallAdExtension()
+    {
+        string folder = Path.Combine(AppContext.BaseDirectory, "edge-extension");
+        if (adBridge?.Outdated == true)
+        {
+            // 装过旧版：Edge 不会自己读新文件，要在扩展页点一下“重新加载”
+            if (MessageBox.Show(L.T("玻璃收纳更新了扩展，Edge 里还是旧的。点「确定」打开 Edge 的扩展页，然后：\n\n", "GlassBox updated its extension, but Edge still has the old one. Click OK to open Edge's extensions page, then:\n\n") +
+                    L.T("1. 在「玻璃收纳 · YouTube 跳过广告」上点「重新加载」（圆圈箭头）\n", "1. On “GlassBox · YouTube ad skip”, click Reload (the circular arrow)\n") +
+                    L.T("2. 把开着的 YouTube 页面刷新一下", "2. Refresh any open YouTube pages"), L.T("更新 Edge 扩展", "Update Edge extension"), MessageBoxButtons.OKCancel, MessageBoxIcon.Information) == DialogResult.OK)
+            {
+                try { Process.Start(new ProcessStartInfo("msedge", "edge://extensions/") { UseShellExecute = true }); }
+                catch (Exception ex) { Log.Error(ex); }
+            }
+            return;
+        }
+        if (!File.Exists(Path.Combine(folder, "manifest.json")))
+        {
+            MessageBox.Show(L.T("没找到扩展文件夹：\n", "Extension folder not found:\n") + folder + L.T("\n\n请重新解压玻璃收纳。", "\n\nPlease extract GlassBox again."), L.T("玻璃收纳", "GlassBox"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (!app.Config.SkipAds)
+        {
+            app.Config.SkipAds = true;
+            app.ScheduleSave();
+            UpdateAds();
+        }
+        try { Clipboard.SetText(folder); } catch (Exception ex) { Log.Error(ex); }
+        var go = MessageBox.Show(
+            L.T("扩展文件夹的路径已经复制好了。点「确定」打开 Edge 的扩展页，然后在 Edge 里：\n\n", "The extension folder path is copied. Click OK to open Edge's extensions page, then in Edge:\n\n") +
+            L.T("1. 打开左边（或右上角）的「开发人员模式」\n", "1. Turn on “Developer mode” (on the left or top right)\n") +
+            L.T("2. 点「加载解压缩的扩展」\n", "2. Click “Load unpacked”\n") +
+            L.T("3. 在弹出的窗口上面的地址栏按 Ctrl+V 粘贴，回车，再点「选择文件夹」\n", "3. In the window that opens, press Ctrl+V in the address bar, press Enter, then click “Select Folder”\n") +
+            L.T("4. 已经开着的 YouTube 页面刷新一下\n\n", "4. Refresh any YouTube pages that are already open\n\n") +
+            L.T("扩展只在 YouTube 上工作，只和本机的玻璃收纳说话。装好后放 YouTube 时这里会显示「已连上」；", "The extension only runs on YouTube and only talks to GlassBox on this PC. Once it's in, this shows “Connected” while YouTube plays. ") +
+            L.T("Edge 偶尔会提示“关闭开发人员模式的扩展”，选保留就行。不想用了在 Edge 扩展页删掉它即可。\n\n", "Edge may sometimes ask you to turn off developer-mode extensions; just keep it. To stop using it, remove it on Edge's extensions page.\n\n") +
+            L.T("文件夹：", "Folder: ") + folder,
+            L.T("装 Edge 扩展", "Install Edge extension"), MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+        if (go != DialogResult.OK) return;
+        try { Process.Start(new ProcessStartInfo("msedge", "edge://extensions/") { UseShellExecute = true }); }
+        catch (Exception ex) { Log.Error(ex); }
+    }
+
+    void SkipAd()
+    {
+        ads?.Skip();
+        adBridge?.Skip();
+        adSkippable = false; // 先把按钮收起来，按没按成一会儿就知道
+    }
+
+    void OnAdChanged(bool found, bool fromExtension)
+    {
+        if (fromExtension) adFromExt = found;
+        else adFromUia = found;
+        adSkippable = (adFromUia || adFromExt) && app.Config.SkipAds;
+        // 收着的时候：胶囊滑下来提示“广告可以跳过了 · 跳过”（正在提示别的、专注时不打断）
+        if (adSkippable && !app.Config.AutoSkipAds && !Focusing && (mode == Mode.Idle || mode == Mode.Notify && adNote))
+            ShowAdNote(L.T("广告可以跳过了", "Ad can be skipped"), chip: true, ms: 15000);
+        else if (!adSkippable && adNote && adNoteChip && mode == Mode.Notify) SetMode(Mode.Idle);
+        UpdateFloat();
+        Redraw();
+    }
+
+    void OnAdSkipped(bool fromExtension)
+    {
+        if (fromExtension) adFromExt = false;
+        else adFromUia = false;
+        adSkippable = (adFromUia || adFromExt) && app.Config.SkipAds;
+        if (!Focusing && (mode == Mode.Idle || mode == Mode.Notify && adNote)) ShowAdNote(L.T("已跳过广告", "Ad skipped"), chip: false, ms: 1600);
+        UpdateFloat();
+        Redraw();
+    }
+
+    void ShowAdNote(string text, bool chip, int ms)
+    {
+        adNoteText = text;
+        adNoteChip = chip;
+        noteUndo = chargeNote = false;
+        notePath = null;
+        noteFence = null;
+        notePage = null;
+        adNote = true;
+        SetMode(Mode.Notify);
+        BuildPill();
+        Schedule(Pending.EndNote, ms);
     }
 
     void SeekMove(float x)
@@ -2870,7 +4651,9 @@ internal sealed class CapsuleWindow : Form
     }
 
     // 两页：“胶囊”是它自己的样子和手感，“桌面与系统”是桌面和 Windows 的开关
-    static readonly string[] SettingTabs = { "胶囊", "音乐", "桌面与系统" };
+    static string[] SettingTabs => L.En
+        ? new[] { "Capsule", "Music", "Lyrics & ads", "Effects", "Desktop & system" }
+        : new[] { "胶囊", "音乐", "歌词与广告", "动效", "桌面与系统" };
     static readonly string[][][] SettingColumns =
     {
         new[]
@@ -2880,13 +4663,23 @@ internal sealed class CapsuleWindow : Form
         },
         new[]
         {
-            new[] { "nowplaying", "musiccard", "motion" },
-            new[] { "song", "lyrics" },
+            new[] { "nowplaying", "musiccard", "motion", "song", "btbattery" },
+            new[] { "backdrop", "turntable", "float", "ctrlmusic", "output" },
+        },
+        new[]
+        {
+            new[] { "lyrics", "netease", "translate", "pilllyrics" },
+            new[] { "skipads", "autoskip", "stillwatch", "adext" },
+        },
+        new[]
+        {
+            new[] { "sky", "charge", "shotfly" },
+            new[] { "focus", "focuslen" },
         },
         new[]
         {
             new[] { "dblclick", "autosort", "sysicons", "shots" },
-            new[] { "tbstyle", "autostart", "trash" },
+            new[] { "tbstyle", "lang", "autostart", "trash" },
         },
     };
 
@@ -2897,6 +4690,22 @@ internal sealed class CapsuleWindow : Form
         "musiccard" => app.Config.MusicCard,
         "motion" => app.Config.MusicMotion,
         "lyrics" => app.Config.Lyrics,
+        "pilllyrics" => app.Config.PillLyrics && app.Config.Lyrics,
+        "sky" => app.Config.SkyGlow,
+        "btbattery" => app.Config.BluetoothBattery,
+        "netease" => app.Config.NeteaseLyrics && app.Config.Lyrics,
+        "translate" => app.Config.LyricTranslation && app.Config.NeteaseLyrics && app.Config.Lyrics,
+        "stillwatch" => app.Config.KeepWatching,
+        "backdrop" => app.Config.MusicBackdrop,
+        "turntable" => app.Config.Turntable,
+        "float" => app.Config.MusicFloat,
+        "ctrlmusic" => app.Config.CtrlLocksMusic,
+        "output" => app.Config.OutputSwitch,
+        "skipads" => app.Config.SkipAds,
+        "autoskip" => app.Config.AutoSkipAds && app.Config.SkipAds,
+        "charge" => app.Config.ChargeEffect,
+        "shotfly" => app.Config.ShotFly,
+        "focus" => app.Config.FocusTimer,
         "ctrl" => app.Config.DoubleCtrlToSummon,
         "dblclick" => app.Config.DoubleClickToHide,
         "autosort" => app.Config.AutoSortNewFiles,
@@ -2939,17 +4748,23 @@ internal sealed class CapsuleWindow : Form
     // 分段按钮：每段的字，和现在选的是第几段
     string[] SegmentNames(string key) => key switch
     {
-        "zoom" => new[] { "关", "小", "中", "大" },
-        "tbstyle" => new[] { "原样", "透明", "磨砂" },
-        "hoveropen" => new[] { "快", "中", "慢", "点击" },
-        _ => new[] { "快", "中", "慢" },
+        "zoom" => L.En ? new[] { "Off", "S", "M", "L" } : new[] { "关", "小", "中", "大" },
+        "tbstyle" => L.En ? new[] { "Normal", "Clear", "Frosted" } : new[] { "原样", "透明", "磨砂" },
+        "hoveropen" => L.En ? new[] { "Fast", "Med", "Slow", "Click" } : new[] { "快", "中", "慢", "点击" },
+        "lang" => new[] { "中文", "English" },
+        "focuslen" => FocusLengths.Select(m => m.ToString()).ToArray(),
+        _ => L.En ? new[] { "Fast", "Med", "Slow" } : new[] { "快", "中", "慢" },
     };
+
+    static readonly int[] FocusLengths = { 15, 25, 45, 60 };
 
     int SegmentValue(string key) => key switch
     {
         "zoom" => app.Config.HoverZoom,
+        "focuslen" => Math.Max(0, Array.IndexOf(FocusLengths, app.Config.FocusMinutes)),
         "tbstyle" => app.Config.TaskbarStyle,
         "hoveropen" => app.Config.HoverOpen,
+        "lang" => L.En ? 1 : 0,
         _ => app.Config.CloseSpeed,
     };
 
@@ -2999,6 +4814,121 @@ internal sealed class CapsuleWindow : Form
                     lyricsLoading = false;
                 }
                 EnsureLyrics();
+                BuildPill();
+                app.ScheduleSave();
+                break;
+            case "pilllyrics":
+                // 收起时滚歌词要先有歌词：打开它时顺便把同步歌词一起打开（那一行写着会联网）
+                config.PillLyrics = !(config.PillLyrics && config.Lyrics);
+                if (config.PillLyrics) config.Lyrics = true;
+                EnsureLyrics();
+                BuildPill();
+                app.ScheduleSave();
+                break;
+            case "netease":
+                // 要先有同步歌词：打开它时顺便打开（那一行写着会联网）；打开后这首没找到的再找一次
+                config.NeteaseLyrics = !(config.NeteaseLyrics && config.Lyrics);
+                if (config.NeteaseLyrics) config.Lyrics = true;
+                if (lyrics == null && !lyricsLoading) lyricsKey = "";
+                EnsureLyrics();
+                app.ScheduleSave();
+                break;
+            case "translate":
+                // 翻译是网易云带的：打开时顺便打开网易云歌词和同步歌词；这首重新读一次（以前存的可能还不带翻译）
+                config.LyricTranslation = !(config.LyricTranslation && config.NeteaseLyrics && config.Lyrics);
+                if (config.LyricTranslation) config.NeteaseLyrics = config.Lyrics = true;
+                if (config.LyricTranslation && !lyricsLoading) lyricsKey = "";
+                EnsureLyrics();
+                app.ScheduleSave();
+                break;
+            case "stillwatch":
+                config.KeepWatching = !config.KeepWatching;
+                if (!config.KeepWatching && !config.SkipAds)
+                {
+                    adBridge?.Dispose();
+                    adBridge = null;
+                    adBridgeFailed = adFromExt = false;
+                }
+                UpdateAds();
+                app.ScheduleSave();
+                break;
+            case "backdrop":
+                config.MusicBackdrop = !config.MusicBackdrop;
+                cardBackdrop.Clear();
+                floatBackdrop.Clear();
+                UpdateFloat();
+                app.ScheduleSave();
+                break;
+            case "turntable":
+                config.Turntable = !config.Turntable;
+                turnLast = -1;
+                deckCache?.Dispose();
+                deckCache = null;
+                app.ScheduleSave();
+                break;
+            case "float":
+                config.MusicFloat = !config.MusicFloat;
+                if (!config.MusicFloat) CloseFloat();
+                app.ScheduleSave();
+                break;
+            case "ctrlmusic":
+                config.CtrlLocksMusic = !config.CtrlLocksMusic;
+                app.ScheduleSave();
+                break;
+            case "output":
+                config.OutputSwitch = !config.OutputSwitch;
+                app.ScheduleSave();
+                break;
+            case "skipads":
+                config.SkipAds = !config.SkipAds;
+                if (!config.SkipAds)
+                {
+                    ads?.Dispose();
+                    ads = null;
+                    if (!config.KeepWatching) // 自动继续还要用扩展：传话的留着
+                    {
+                        adBridge?.Dispose();
+                        adBridge = null;
+                        adBridgeFailed = false;
+                    }
+                    adFromUia = adFromExt = adSkippable = false;
+                }
+                UpdateAds();
+                app.ScheduleSave();
+                break;
+            case "adext":
+                InstallAdExtension();
+                break;
+            case "autoskip":
+                config.AutoSkipAds = !(config.AutoSkipAds && config.SkipAds);
+                if (config.AutoSkipAds) config.SkipAds = true;
+                app.ScheduleSave();
+                break;
+            case "btbattery":
+                config.BluetoothBattery = !config.BluetoothBattery;
+                btLevels = new();
+                if (config.BluetoothBattery) ReadBluetooth();
+                app.ScheduleSave();
+                break;
+            case "sky":
+                config.SkyGlow = !config.SkyGlow;
+                app.ScheduleSave();
+                break;
+            case "charge":
+                config.ChargeEffect = !config.ChargeEffect;
+                app.ScheduleSave();
+                break;
+            case "shotfly":
+                config.ShotFly = !config.ShotFly;
+                app.ScheduleSave();
+                break;
+            case "focus":
+                config.FocusTimer = !config.FocusTimer;
+                if (!config.FocusTimer && focusEnd != null) StopFocus();
+                app.ScheduleSave();
+                break;
+            case "focuslen":
+                config.FocusMinutes = FocusLengths[Math.Clamp(value, 0, FocusLengths.Length - 1)];
                 app.ScheduleSave();
                 break;
             case "autosort":
@@ -3024,6 +4954,7 @@ internal sealed class CapsuleWindow : Form
                 break;
             case "autohide": app.SetCapsuleAutoHide(!config.CapsuleAutoHide); break;
             case "tbstyle": app.SetTaskbarStyle(value); break;
+            case "lang": app.SetLanguage(value == 1 ? "en" : "zh"); break;
             case "tab": settingsTab = value; break;
         }
         Redraw();
@@ -3076,10 +5007,10 @@ internal sealed class CapsuleWindow : Form
 
         var inner = RectangleF.Inflate(area, -22 * s, -16 * s);
         var mouse = PointToClient(Cursor.Position);
-        DrawTight(g, "设置", boldFont, Ink(a), inner.X, inner.Y + 11 * s);
+        DrawTight(g, L.T("设置", "Settings"), boldFont, Ink(a), inner.X, inner.Y + 11 * s);
 
         // 页签：标题右边两颗小胶囊
-        float tx = inner.X + Measure("设置", boldFont) * s + 16 * s, th = 26 * s;
+        float tx = inner.X + Measure(L.T("设置", "Settings"), boldFont) * s + 16 * s, th = 26 * s;
         for (int i = 0; i < SettingTabs.Length; i++)
         {
             float tw = Measure(SettingTabs[i], chipFont) * s + 24 * s;
@@ -3091,7 +5022,7 @@ internal sealed class CapsuleWindow : Form
             settingHits.Add((b, "tab", i));
             tx += tw + 6 * s;
         }
-        string hint = "改了马上生效 · Esc 关闭";
+        string hint = L.T("改了马上生效 · Esc 关闭", "Changes apply instantly · Esc to close");
         float hw = Measure(hint, smallFont) * s;
         if (inner.Right - hw > tx + 12 * s) DrawTight(g, hint, smallFont, Ink(.5f * a), inner.Right - hw, inner.Y + 12 * s);
 
@@ -3120,30 +5051,49 @@ internal sealed class CapsuleWindow : Form
         float s = S, cy = row.Y + row.Height / 2;
         string label = key switch
         {
-            "clarity" => $"玻璃透明度  {app.Config.GlassClarity}%",
-            "width" => $"展开宽度  {app.Config.OpenWidth}",
-            "height" => $"展开最大高度  {app.Config.OpenHeight}",
-            "topgap" => $"离屏幕顶部  {app.Config.CapsuleTopGap}",
-            "zoom" => "悬停放大",
-            "hoveropen" => "鼠标停上去展开",
-            "closespeed" => "鼠标离开后收起",
-            "song" => "跟随歌曲变色",
-            "nowplaying" => "胶囊上显示正在播放",
-            "musiccard" => "悬停时打开音乐卡片",
-            "motion" => "封面旋转、音柱跟着声音跳",
-            "lyrics" => "同步歌词（联网查 lrclib.net）",
-            "ctrl" => "连按两下 Ctrl 呼出",
-            "dblclick" => "双击桌面空白处隐藏",
-            "autosort" => "新文件自动按类型收纳",
-            "shots" => "「图像」页收所有截图",
-            "trash" => "拖到右下角丢进回收站",
-            "sysicons" => "隐藏系统桌面图标",
-            "autohide" => "顶部胶囊自动隐藏",
-            "tbstyle" => "Windows 任务栏",
-            _ => "开机自动启动",
+            "clarity" => L.T($"玻璃透明度  {app.Config.GlassClarity}%", $"Glass clarity  {app.Config.GlassClarity}%"),
+            "width" => L.T($"展开宽度  {app.Config.OpenWidth}", $"Open width  {app.Config.OpenWidth}"),
+            "height" => L.T($"展开最大高度  {app.Config.OpenHeight}", $"Max open height  {app.Config.OpenHeight}"),
+            "topgap" => L.T($"离屏幕顶部  {app.Config.CapsuleTopGap}", $"Gap from top  {app.Config.CapsuleTopGap}"),
+            "zoom" => L.T("悬停放大", "Zoom on hover"),
+            "hoveropen" => L.T("鼠标停上去展开", "Open on hover"),
+            "closespeed" => L.T("鼠标离开后收起", "Close when mouse leaves"),
+            "song" => L.T("跟随歌曲变色", "Tint to match the song"),
+            "nowplaying" => L.T("胶囊上显示正在播放", "Show now playing on capsule"),
+            "musiccard" => L.T("悬停时打开音乐卡片", "Open music card on hover"),
+            "motion" => L.T("封面旋转、音柱跟着声音跳", "Spinning cover, bars follow sound"),
+            "lyrics" => L.T("同步歌词（联网查 lrclib.net）", "Synced lyrics (online, lrclib.net)"),
+            "pilllyrics" => L.T("收起时胶囊上滚动歌词", "Lyrics on the closed capsule"),
+            "sky" => L.T("天色光：胶囊跟着早晚变色", "Sky glow: tint follows time of day"),
+            "btbattery" => L.T("音乐卡片显示蓝牙耳机电量", "Bluetooth headphone battery on card"),
+            "netease" => L.T("也从网易云找歌词（中文歌多、逐字亮）", "Also use NetEase (Chinese songs, word sync)"),
+            "translate" => L.T("外文歌下面显示中文翻译（网易云）", "Chinese translation line (NetEase)"),
+            "stillwatch" => L.T("“仍在观看吗？”自动继续（要扩展）", "Auto-continue “Still watching?” (ext.)"),
+            "backdrop" => L.T("卡片背景用模糊流动的封面", "Blurred flowing cover as background"),
+            "turntable" => L.T("封面换成唱片机（放歌时转）", "Turntable instead of cover"),
+            "float" => L.T("卡片能往下拖出来放在桌面上", "Drag card down onto the desktop"),
+            "ctrlmusic" => L.T("放歌时连按两下 Ctrl 锁住卡片", "Ctrl twice locks card while playing"),
+            "output" => L.T("点输出设备切换音箱 / 耳机", "Click output device to switch"),
+            "skipads" => L.T("YouTube 广告：胶囊上一点就跳过", "YouTube ads: click capsule to skip"),
+            "autoskip" => L.T("能跳过的广告自动跳过", "Auto-skip skippable ads"),
+            "adext" => L.T("装 Edge 扩展：后台标签页也能跳", "Edge add-on: background tabs too"),
+            "charge" => L.T("插上充电器时的充电动画", "Charging animation when plugged in"),
+            "shotfly" => L.T("截图像飞进胶囊一样", "Screenshots fly into the capsule"),
+            "focus" => L.T("番茄钟（面板上多一个计时按钮）", "Focus timer (adds a timer button)"),
+            "focuslen" => L.T("每次专注（分钟）", "Focus length (minutes)"),
+            "ctrl" => L.T("连按两下 Ctrl 呼出", "Ctrl twice to summon"),
+            "dblclick" => L.T("双击桌面空白处隐藏", "Double-click desktop to hide"),
+            "autosort" => L.T("新文件自动按类型收纳", "Auto-file new files by type"),
+            "shots" => L.T("「图像」页收所有截图", "“Images” page collects screenshots"),
+            "trash" => L.T("拖到右下角丢进回收站", "Drag to bottom-right to recycle"),
+            "sysicons" => L.T("隐藏系统桌面图标", "Hide system desktop icons"),
+            "autohide" => L.T("顶部胶囊自动隐藏", "Auto-hide top capsule"),
+            "tbstyle" => L.T("Windows 任务栏", "Windows taskbar"),
+            "lang" => "语言 / Language",
+            _ => L.T("开机自动启动", "Start with Windows"),
         };
         bool slider = key is "clarity" or "width" or "height" or "topgap";
-        bool segments = key is "zoom" or "tbstyle" or "hoveropen" or "closespeed";
+        bool segments = key is "zoom" or "tbstyle" or "hoveropen" or "closespeed" or "focuslen" or "lang";
         var hit = RectangleF.Inflate(row, 6 * s, -3 * s);
         if (!slider && !segments && hit.Contains(mouse)) FillRound(g, hit, 10 * s, Ink(.06f * a));
         DrawTight(g, label, labelFont, Ink(.92f * a), row.X, cy);
@@ -3180,6 +5130,17 @@ internal sealed class CapsuleWindow : Form
                 DrawTight(g, names[i], chipFont, on ? Deep(a) : Ink(.8f * a), b.X + (bw - tw) / 2, cy);
                 settingHits.Add((b, key, i));
             }
+        }
+        else if (key == "adext")
+        {
+            // 不是开关：一个小按钮，点了打开 Edge 的扩展页；扩展来过就显示“已连上”
+            bool outdated = adBridge?.Outdated == true, linked = adBridge?.Seen == true && !outdated;
+            string text = outdated ? L.T("要重新加载…", "Reload needed…") : linked ? L.T("已连上 ✓", "Connected ✓") : L.T("怎么装…", "How to install…");
+            float bw = Measure(text, chipFont) * s + 24 * s, bh = 26 * s;
+            var b = new RectangleF(row.Right - bw - 4 * s, cy - bh / 2, bw, bh);
+            FillRound(g, b, bh / 2, linked ? Ink(.10f * a) : hit.Contains(mouse) ? Ink(.9f * a) : Ink(.18f * a));
+            DrawTight(g, text, chipFont, !linked && hit.Contains(mouse) ? Deep(a) : Ink(.85f * a), b.X + 12 * s, cy);
+            settingHits.Add((hit, key, 0));
         }
         else
         {
@@ -3238,18 +5199,18 @@ internal sealed class CapsuleWindow : Form
         var lines = new List<string>();
         try
         {
-            if (item.IsDir) lines.Add("文件夹");
+            if (item.IsDir) lines.Add(L.T("文件夹", "Folder"));
             else
             {
                 long size = new FileInfo(item.Path).Length;
-                string kind = item.Ext.Length > 0 ? item.Ext.TrimStart('.').ToUpperInvariant() + " 文件" : "文件";
-                if (item.HidesExtension) kind = "快捷方式";
+                string kind = item.Ext.Length > 0 ? item.Ext.TrimStart('.').ToUpperInvariant() + L.T(" 文件", " file") : L.T("文件", "File");
+                if (item.HidesExtension) kind = L.T("快捷方式", "Shortcut");
                 lines.Add($"{kind} · {FormatSize(size)}");
             }
         }
-        catch (Exception) { lines.Add(item.IsDir ? "文件夹" : "文件"); }
-        lines.Add($"修改于 {item.Modified:yyyy-MM-dd HH:mm}");
-        lines.Add($"放进来 {item.Created:yyyy-MM-dd HH:mm}");
+        catch (Exception) { lines.Add(item.IsDir ? L.T("文件夹", "Folder") : L.T("文件", "File")); }
+        lines.Add(L.T($"修改于 {item.Modified:yyyy-MM-dd HH:mm}", $"Modified {item.Modified:yyyy-MM-dd HH:mm}"));
+        lines.Add(L.T($"放进来 {item.Created:yyyy-MM-dd HH:mm}", $"Added {item.Created:yyyy-MM-dd HH:mm}"));
         lines.Add(Path.GetDirectoryName(item.Path) ?? "");
         return string.Join("\n", lines);
     }
@@ -3289,7 +5250,7 @@ internal sealed class CapsuleWindow : Form
             FillRound(g, view, 12 * s, Ink(.06f * a));
             using var brush = new SolidBrush(Ink(.85f * a));
             using var format = new StringFormat { Trimming = StringTrimming.EllipsisCharacter };
-            g.DrawString(previewText.Length > 0 ? previewText : "（空文件）", smallFont, brush, RectangleF.Inflate(view, -12 * s, -10 * s), format);
+            g.DrawString(previewText.Length > 0 ? previewText : L.T("（空文件）", "(empty file)"), smallFont, brush, RectangleF.Inflate(view, -12 * s, -10 * s), format);
         }
         else if (previewImage != null)
         {
@@ -3310,13 +5271,13 @@ internal sealed class CapsuleWindow : Form
             if (previewText != null) // 文件夹：右半边列出里面的东西
             {
                 using var brush = new SolidBrush(Ink(.78f * a));
-                g.DrawString(previewText.Length > 0 ? previewText : "（空文件夹）", smallFont, brush, new RectangleF(box.Right + 12 * s, view.Y + 4 * s, view.Width - box.Width - 12 * s, view.Height - 8 * s));
+                g.DrawString(previewText.Length > 0 ? previewText : L.T("（空文件夹）", "(empty folder)"), smallFont, brush, new RectangleF(box.Right + 12 * s, view.Y + 4 * s, view.Width - box.Width - 12 * s, view.Height - 8 * s));
             }
         }
         else
         {
             using var brush = new SolidBrush(Ink(.5f * a));
-            g.DrawString("正在加载预览…", labelFont, brush, view, CenterFormat);
+            g.DrawString(L.T("正在加载预览…", "Loading preview…"), labelFont, brush, view, CenterFormat);
         }
 
         // 右边：名字、信息、按键
@@ -3329,7 +5290,7 @@ internal sealed class CapsuleWindow : Form
             using var dim = new SolidBrush(Ink(.62f * a));
             g.DrawString(previewInfo, smallFont, dim, new RectangleF(info.X, nameBox.Y + Math.Min(used.Height, nameBox.Height) + 10 * s, info.Width, info.Height * .6f), format);
         }
-        DrawTight(g, "Enter 打开 · 空格关闭 · ←→ 换一个", smallFont, Ink(.55f * a), info.X, info.Bottom - 8 * s);
+        DrawTight(g, L.T("Enter 打开 · 空格关闭 · ←→ 换一个", "Enter open · Space close · ←→ next"), smallFont, Ink(.55f * a), info.X, info.Bottom - 8 * s);
     }
 
     // ---------- 命中测试 ----------
@@ -3374,6 +5335,13 @@ internal sealed class CapsuleWindow : Form
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        if (detaching)
+        {
+            // 正拖着刚拎出来的小播放器
+            if (e.Button == MouseButtons.Left && floatWin != null) floatWin.MoveCard(new Point(Cursor.Position.X - detachGrab.X, Cursor.Position.Y - detachGrab.Y));
+            else EndDetach();
+            return;
+        }
         cursor = Cursor.Position;
         cursorOverDesktop = true;
         if (sliderDrag != null && e.Button == MouseButtons.Left)
@@ -3383,6 +5351,11 @@ internal sealed class CapsuleWindow : Form
         }
         if (mode == Mode.Music)
         {
+            if (e.Button == MouseButtons.Left && cardPressed && app.Config.MusicFloat && media != null && e.Y - cardPressAt.Y > 34 * S)
+            {
+                BeginDetach(e.Location);
+                return;
+            }
             if (e.Button == MouseButtons.Left && seekDrag) SeekMove(e.X);
             else if (e.Button == MouseButtons.Left && volumeDrag) VolumeMove(e.X);
             bool hot = seekDrag || volumeDrag;
@@ -3456,6 +5429,8 @@ internal sealed class CapsuleWindow : Form
         // 晚一拍再看：正常松手时 WinForms 也会先放掉鼠标，那时松手的处理会先跑完
         if (liftPath != null && !Capture)
             BeginInvoke(new Action(() => { if (liftPath != null && !Capture) EndLift(drop: false); }));
+        if (detaching && !Capture)
+            BeginInvoke(new Action(() => { if (detaching && !Capture) EndDetach(); }));
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -3478,6 +5453,11 @@ internal sealed class CapsuleWindow : Form
         if (mode != Mode.Open)
         {
             if (!CapsuleRect.Contains(e.Location)) return;
+            if (mode == Mode.Notify && adNote)
+            {
+                if (adNoteChip) SkipAd(); // “广告可以跳过了 · 跳过”：点胶囊就跳
+                return;
+            }
             if (mode == Mode.Notify && noteUndo) UndoTrash(); // “已丢进回收站 · 撤销”：拿回来，再展开到它那里
             // 点胶囊：展开；点的是“已收进”的提示就直接跳到那个文件
             var fence = noteFence;
@@ -3507,6 +5487,11 @@ internal sealed class CapsuleWindow : Form
             ClosePreview();
             return;
         }
+        if (!settingsOpen && focusRect.Contains(e.Location))
+        {
+            ToggleFocus(); // 开始专注 / 提前结束
+            return;
+        }
         if (SettingsMouseDown(e.Location)) return;
         if (Now < trashToastUntil && trashUndoRect.Contains(e.Location))
         {
@@ -3523,6 +5508,8 @@ internal sealed class CapsuleWindow : Form
         }
         if (media != null && !settingsOpen && playerInfo.Contains(e.Location))
         {
+            // 卡片比文件面板矮：点完鼠标还在下面，要给时间移上去（移到卡片上就照常，离开才收）
+            musicHoldUntil = Now + 5000;
             SetMode(Mode.Music);
             return;
         }
@@ -3555,6 +5542,12 @@ internal sealed class CapsuleWindow : Form
     {
         base.OnMouseUp(e);
         var screen = PointToScreen(e.Location);
+        if (detaching && e.Button == MouseButtons.Left)
+        {
+            EndDetach();
+            return;
+        }
+        if (e.Button == MouseButtons.Left) cardPressed = false;
         if (e.Button == MouseButtons.Left)
         {
             if (seekDrag)
@@ -3599,6 +5592,15 @@ internal sealed class CapsuleWindow : Form
         }
         if (e.Button != MouseButtons.Right) return;
 
+        if (mode == Mode.Music && CapsuleRect.Contains(e.Location))
+        {
+            // 音乐卡片上右键：锁住、放到桌面、换歌词、调歌词时间、换输出设备
+            menuOpen = true;
+            try { ShowMusicMenu(screen); }
+            finally { menuOpen = false; }
+            if (mode == Mode.Music && Distance(Cursor.Position, capsuleOnScreen) > 46 * S) Schedule(Pending.Close, CloseMs);
+            return;
+        }
         menuOpen = true;
         try
         {
@@ -3624,12 +5626,13 @@ internal sealed class CapsuleWindow : Form
     protected override void OnMouseWheel(MouseEventArgs e)
     {
         base.OnMouseWheel(e);
-        if (mode == Mode.Music) // 在音乐卡片上滚：调音量
+        if (mode == Mode.Music) // 在音乐卡片上滚：调音量，封面上浮出一个大数字
         {
             if (volume < 0 || media == null) return;
             volume = Math.Clamp(volume + e.Delta / 120f * .05f, 0, 1);
             Audio.SetVolume(media.Source, volume, volumePerApp);
             volumeRead = Now;
+            volumeShownSince = Now;
             Redraw();
             return;
         }
@@ -3774,7 +5777,7 @@ internal sealed class CapsuleWindow : Form
     RectangleF TrashZone(RectangleF c)
     {
         float s = S, h = 32 * s;
-        float w = Math.Max(Measure("拖到这里丢进回收站", smallFont) * s + 64 * s, Math.Min(300 * s, c.Width * .42f));
+        float w = Math.Max(Measure(L.T("拖到这里丢进回收站", "Drag here to recycle"), smallFont) * s + 64 * s, Math.Min(300 * s, c.Width * .42f));
         return new RectangleF(c.Right - 14 * s - w, c.Bottom - 22 * s - h / 2, w, h);
     }
 
@@ -3799,7 +5802,7 @@ internal sealed class CapsuleWindow : Form
         if (!app.Config.TrashDrop) return false;
         if (Directory.Exists(item.Path))
         {
-            trashToast = "文件夹不在这里删，要删请去资源管理器";
+            trashToast = L.T("文件夹不在这里删，要删请去资源管理器", "Folders can't be deleted here, use File Explorer");
             trashToastUntil = Now + 2600;
             Redraw();
             return false;
@@ -3814,7 +5817,7 @@ internal sealed class CapsuleWindow : Form
         trashSince = Now;
         trashKicked = false;
         // OneDrive 里的文件删了云端也会跟着删（OneDrive 网页的回收站 30 天内还能找回），说一声
-        trashToast = InOneDrive(item.Path) ? "已丢进回收站（OneDrive 会同步删除）" : "已丢进回收站";
+        trashToast = InOneDrive(item.Path) ? L.T("已丢进回收站（OneDrive 会同步删除）", "Moved to Recycle Bin (OneDrive deletes it too)") : L.T("已丢进回收站", "Moved to Recycle Bin");
         trashToastUntil = Now + trashTimer.Interval;
         trashTimer.Stop();
         trashTimer.Start();
@@ -3927,7 +5930,7 @@ internal sealed class CapsuleWindow : Form
 
         if (liftPath != null)
         {
-            string label = trashHot ? "松手，丢进回收站" : "拖到这里丢进回收站";
+            string label = trashHot ? L.T("松手，丢进回收站", "Release to recycle") : L.T("拖到这里丢进回收站", "Drag here to recycle");
             DrawTight(g, label, smallFont, trashHot ? Color.FromArgb(Byte(fade), 255, 255, 255) : Ink(.7f * fade), zone.X + 16 * s, m.Y);
         }
 
@@ -3950,18 +5953,18 @@ internal sealed class CapsuleWindow : Form
     void DrawTrashToast(Graphics g, RectangleF c, float a)
     {
         float s = S, fy = c.Bottom - 22 * s;
-        bool undo = CanUndoTrash && trashToast.StartsWith("已丢进回收站");
+        bool undo = CanUndoTrash && trashToast.StartsWith(L.T("已丢进回收站", "Moved to Recycle Bin"));
         string name = undo ? $"「{Shorten(trashItem!.Name, 16)}」" : "";
         float x = c.X + 20 * s;
         DrawTight(g, trashToast + name, smallFont, Ink(.8f * a), x, fy);
         x += Measure(trashToast + name, smallFont) * s + 10 * s;
         if (undo)
         {
-            float w = Measure("撤销", chipFont) * s + 20 * s;
+            float w = Measure(L.T("撤销", "Undo"), chipFont) * s + 20 * s;
             trashUndoRect = new RectangleF(x, fy - 12 * s, w, 24 * s);
             bool hot = trashUndoRect.Contains(PointToClient(Cursor.Position));
             FillRound(g, trashUndoRect, 12 * s, Ink((hot ? .3f : .18f) * a));
-            DrawTight(g, "撤销", chipFont, Ink(.95f * a), x + 10 * s, fy);
+            DrawTight(g, L.T("撤销", "Undo"), chipFont, Ink(.95f * a), x + 10 * s, fy);
         }
         else trashUndoRect = RectangleF.Empty;
     }
@@ -4038,7 +6041,7 @@ internal sealed class CapsuleWindow : Form
         app.MoveItem(path, fence, 0);
         freshPath = path;
         freshSince = Now;
-        trashToast = $"已移到「{fence.Name}」";
+        trashToast = L.T($"已移到「{fence.Name}」", $"Moved to “{fence.Name}”");
         trashToastUntil = Now + 2400;
         Redraw();
     }
@@ -4157,7 +6160,7 @@ internal sealed class CapsuleWindow : Form
             bool toChip = chip >= 0 && (chip != tab || query.Length > 0);
             e.Effect = toChip || inGrid ? DragDropEffects.Move : DragDropEffects.None;
             e.DropImageType = toChip || inGrid ? DropImageType.Move : DropImageType.None;
-            e.Message = toChip ? "移到 %1" : inGrid ? "放在这里" : "";
+            e.Message = toChip ? L.T("移到 %1", "Move to %1") : inGrid ? L.T("放在这里", "Place here") : "";
             e.MessageReplacementToken = toChip ? pages[chip].Name : "";
             return;
         }
@@ -4169,9 +6172,9 @@ internal sealed class CapsuleWindow : Form
         // 只是收纳一个引用，不移动文件
         e.Effect = DragDropEffects.Link;
         e.DropImageType = DropImageType.Link;
-        e.Message = "收纳到 %1";
+        e.Message = L.T("收纳到 %1", "File into %1");
         e.MessageReplacementToken = chip >= 0 ? pages[chip].Name : inGrid ? CurrentPage!.Value.Name
-            : dropFiles.Length == 1 ? app.CategoryNameFor(dropFiles[0]) : "对应分类";
+            : dropFiles.Length == 1 ? app.CategoryNameFor(dropFiles[0]) : L.T("对应分类", "its category");
     }
 
     /// <summary>拖到网格最上面/最下面一条时自动滚动，可以拖到看不见的位置。</summary>
@@ -4235,7 +6238,7 @@ internal sealed class CapsuleWindow : Form
         }
         var (item, fence) = placed[0];
         if (mode == Mode.Receive) mode = Mode.Idle; // 让 ShowFiled 走提示那条路
-        ShowFiled(item, fence, placed.Count > 1 ? $"收纳了 {placed.Count} 个文件" : "已收进");
+        ShowFiled(item, fence, placed.Count > 1 ? L.T($"收纳了 {placed.Count} 个文件", $"Filed {placed.Count} items into") : L.T("已收进", "Filed into"));
         ripple = Now;
         Kick();
     }
@@ -4295,6 +6298,9 @@ internal sealed class CapsuleWindow : Form
                 Interlocked.Exchange(ref framePending, 0);
                 if (pacing) OnFrame();
                 return;
+            case WM_POWERBROADCAST when (int)m.WParam == PBT_APMPOWERSTATUSCHANGE:
+                OnPowerChanged();
+                break;
         }
         base.WndProc(ref m);
     }
@@ -4337,7 +6343,7 @@ internal sealed class CapsuleWindow : Form
 
     void CreateFonts()
     {
-        foreach (var font in new[] { pillFont, boldFont, chipFont, smallFont, labelFont, searchFont, clockFont, titleFont, lyricFont, lyricNextFont }) font?.Dispose();
+        foreach (var font in new[] { pillFont, boldFont, chipFont, smallFont, labelFont, searchFont, clockFont, titleFont, lyricFont, lyricNextFont, volumeFont }) font?.Dispose();
         fitCache.Clear();
         const string face = "Microsoft YaHei UI";
         pillFont = new Font(face, Px(13), FontStyle.Regular, GraphicsUnit.Pixel);
@@ -4350,6 +6356,7 @@ internal sealed class CapsuleWindow : Form
         titleFont = new Font(face, Px(17), FontStyle.Bold, GraphicsUnit.Pixel);
         lyricFont = new Font(face, Px(19), FontStyle.Bold, GraphicsUnit.Pixel);
         lyricNextFont = new Font(face, Px(14), FontStyle.Regular, GraphicsUnit.Pixel);
+        volumeFont = new Font(face, Px(30), FontStyle.Bold, GraphicsUnit.Pixel);
     }
 
     protected override void Dispose(bool disposing)
@@ -4360,10 +6367,18 @@ internal sealed class CapsuleWindow : Form
             foreach (var path in trashQueue)
                 try { Recycle(path); } catch (Exception ex) { Log.Error(ex); }
             trashQueue.Clear();
-            foreach (var timer in new[] { frame, watch, later, caret, trim, chipHold, trashTimer }) timer.Dispose();
+            foreach (var timer in new[] { frame, watch, later, caret, trim, chipHold, trashTimer, focusTick, mediaGap }) timer.Dispose();
             StopPacing();
-            foreach (var font in new[] { pillFont, boldFont, chipFont, smallFont, labelFont, searchFont, clockFont, titleFont, lyricFont, lyricNextFont }) font.Dispose();
+            foreach (var font in new[] { pillFont, boldFont, chipFont, smallFont, labelFont, searchFont, clockFont, titleFont, lyricFont, lyricNextFont, volumeFont }) font.Dispose();
             lyricsCancel?.Cancel();
+            ads?.Dispose();
+            adBridge?.Dispose();
+            floatWin?.Dispose();
+            cardBackdrop.Clear();
+            floatBackdrop.Clear();
+            deckCache?.Dispose();
+            labelFace?.Dispose();
+            foreach (var path in lyricPaths.Values) path.Dispose();
             measure.Dispose();
             measureBitmap.Dispose();
             surface.Dispose();

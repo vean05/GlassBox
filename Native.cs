@@ -22,7 +22,8 @@ internal static class Native
     /// <summary>GlassBox.exe --music 发给正在运行的那个：打开音乐卡片。</summary>
     public const int WM_SHOW_MUSIC = 0x8000 + 0x4D;
     public const int WM_ACTIVATE = 0x0006, WM_GETOBJECT = 0x003D, WM_IME_STARTCOMPOSITION = 0x010D, MA_ACTIVATE = 1;
-    public const int WS_EX_LAYERED = 0x00080000;
+    public const int WS_EX_LAYERED = 0x00080000, WS_EX_TOPMOST = 0x00000008;
+    public const int WM_POWERBROADCAST = 0x0218, PBT_APMPOWERSTATUSCHANGE = 0x000A;
     public const int ULW_ALPHA = 2;
     public const byte AC_SRC_ALPHA = 1;
     public const uint SPI_GETDESKWALLPAPER = 0x0073, SPI_GETCLIENTAREAANIMATION = 0x1042;
