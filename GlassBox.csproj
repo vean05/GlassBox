@@ -10,7 +10,7 @@
     <AssemblyName>GlassBox</AssemblyName>
     <RootNamespace>GlassBox</RootNamespace>
     <Product>玻璃收纳</Product>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationVisualStyles>true</ApplicationVisualStyles>
     <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
