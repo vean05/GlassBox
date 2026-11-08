@@ -1445,6 +1445,9 @@ internal sealed class CapsuleWindow : Form
         return Color.FromArgb(Byte(alpha), t.R / 4, t.G / 4, t.B / 4);
     }
 
+    /// <summary>画在 Ink 实心底（选中的标签、亮着的按钮）上的字：浅色玻璃时底是深的，字就要用浅的，不然黑底黑字。</summary>
+    Color OnInk(float alpha) => DarkInk ? Color.FromArgb(Byte(alpha), Mix(app.Tone.Tint, Color.White, .88f)) : Deep(alpha);
+
     static int Byte(float alpha) => Math.Clamp((int)(alpha * 255), 0, 255);
 
     static Color Mix(Color a, Color b, float t) => Color.FromArgb(
@@ -2335,8 +2338,8 @@ internal sealed class CapsuleWindow : Form
             string name = pages[i].Name, count = pages[i].Count.ToString();
             float nameW = Measure(name, chipFont) * s;
             float ty = r.Y + r.Height / 2;
-            DrawTight(g, name, chipFont, on ? Deep(a) : Ink(.85f * a), r.X + 12 * s, ty);
-            DrawTight(g, count, smallFont, on ? Deep(.6f * a) : Ink(.55f * a), r.X + 12 * s + nameW + 6 * s, ty + 1 * s);
+            DrawTight(g, name, chipFont, on ? OnInk(a) : Ink(.85f * a), r.X + 12 * s, ty);
+            DrawTight(g, count, smallFont, on ? OnInk(.6f * a) : Ink(.55f * a), r.X + 12 * s + nameW + 6 * s, ty + 1 * s);
             if (i == FixedPages - 1) Fill(g, new RectangleF(r.Right + 8 * s, r.Y + 8 * s, Math.Max(1, s), r.Height - 16 * s), Ink(.25f * a));
         }
         if (chipLift >= 0 && chipLift < chipRects.Count)
@@ -2349,8 +2352,8 @@ internal sealed class CapsuleWindow : Form
             FillRound(g, r, r.Height / 2, Ink(.95f * a));
             string name = pages[chipLift].Name, count = pages[chipLift].Count.ToString();
             float nameW = Measure(name, chipFont) * s;
-            DrawTight(g, name, chipFont, Deep(a), r.X + 12 * s, r.Y + r.Height / 2);
-            DrawTight(g, count, smallFont, Deep(.6f * a), r.X + 12 * s + nameW + 6 * s, r.Y + r.Height / 2 + 1 * s);
+            DrawTight(g, name, chipFont, OnInk(a), r.X + 12 * s, r.Y + r.Height / 2);
+            DrawTight(g, count, smallFont, OnInk(.6f * a), r.X + 12 * s + nameW + 6 * s, r.Y + r.Height / 2 + 1 * s);
         }
         g.Restore(clip);
         // 两头还有没露出来的标签：边上淡一点提示可以滚
@@ -2422,7 +2425,7 @@ internal sealed class CapsuleWindow : Form
 
     void FadeEdge(Graphics g, RectangleF r, bool left, float a)
     {
-        var tint = Deep(1);
+        var tint = DarkInk ? Mix(app.Tone.Tint, Color.White, .8f) : Deep(1); // 浅色玻璃时淡出成浅色，不然边上一块黑
         using var brush = new LinearGradientBrush(r, Color.FromArgb(Byte(.0f), tint), Color.FromArgb(Byte(.0f), tint), LinearGradientMode.Horizontal);
         var blend = new ColorBlend
         {
@@ -2824,7 +2827,7 @@ internal sealed class CapsuleWindow : Form
         {
             if (musicPinned) FillRound(g, lockRect, 14 * s, Ink(.9f * a));
             else if (lockHot) FillRound(g, lockRect, 14 * s, Ink(.14f * a));
-            DrawLock(g, lockRect.X + lockRect.Width / 2, lockRect.Y + lockRect.Height / 2, musicPinned, musicPinned ? Deep(a) : Ink(lockAlpha * a));
+            DrawLock(g, lockRect.X + lockRect.Width / 2, lockRect.Y + lockRect.Height / 2, musicPinned, musicPinned ? OnInk(a) : Ink(lockAlpha * a));
             musicHits.Add((lockRect, "lock", 0));
         }
 
@@ -2874,8 +2877,8 @@ internal sealed class CapsuleWindow : Form
             float kw = Measure(skip, chipFont) * s + 36 * s;
             var kb = new RectangleF(limit - kw, rcy - 13 * s, kw, 26 * s);
             FillRound(g, kb, 13 * s, Ink(.92f * a));
-            DrawSkip(g, kb.X + 15 * s, rcy, Deep(a));
-            DrawTight(g, skip, chipFont, Deep(a), kb.X + 26 * s, rcy);
+            DrawSkip(g, kb.X + 15 * s, rcy, OnInk(a));
+            DrawTight(g, skip, chipFont, OnInk(a), kb.X + 26 * s, rcy);
             musicHits.Add((kb, "skipad", 0));
             limit = kb.X - 8 * s;
         }
@@ -3587,7 +3590,7 @@ internal sealed class CapsuleWindow : Form
         if (x + w > limit) return -1;
         var b = new RectangleF(x, cy - h / 2, w, h);
         FillRound(g, b, h / 2, on ? Ink(.9f * a) : b.Contains(mouse) ? Ink(.18f * a) : Ink(.09f * a));
-        DrawTight(g, text, chipFont, on ? Deep(a) : Ink(.82f * a), b.X + 11 * s, cy);
+        DrawTight(g, text, chipFont, on ? OnInk(a) : Ink(.82f * a), b.X + 11 * s, cy);
         musicHits.Add((b, key, value));
         return w;
     }
@@ -4678,7 +4681,7 @@ internal sealed class CapsuleWindow : Form
         },
         new[]
         {
-            new[] { "dblclick", "autosort", "sysicons", "shots" },
+            new[] { "dblclick", "autosort", "sysicons", "shots", "paste" },
             new[] { "tbstyle", "lang", "autostart", "trash" },
         },
     };
@@ -4711,6 +4714,7 @@ internal sealed class CapsuleWindow : Form
         "autosort" => app.Config.AutoSortNewFiles,
         "shots" => app.Config.ScreenshotPage,
         "trash" => app.Config.TrashDrop,
+        "paste" => app.Config.DesktopPaste,
         "sysicons" => app.Config.HideSystemIcons,
         "autostart" => autoStartOn,
         "autohide" => app.Config.CapsuleAutoHide,
@@ -4946,6 +4950,7 @@ internal sealed class CapsuleWindow : Form
                 app.ScheduleSave();
                 break;
             case "ctrl": app.SetDoubleCtrlToSummon(!config.DoubleCtrlToSummon); break;
+            case "paste": app.SetDesktopPaste(!config.DesktopPaste); break;
             case "dblclick": app.SetDoubleClickToHide(!config.DoubleClickToHide); break;
             case "sysicons": app.SetHideSystemIcons(!config.HideSystemIcons); break;
             case "autostart":
@@ -5018,7 +5023,7 @@ internal sealed class CapsuleWindow : Form
             bool on = settingsTab == i;
             if (on) FillRound(g, b, th / 2, Ink(.92f * a));
             else if (b.Contains(mouse)) FillRound(g, b, th / 2, Ink(.12f * a));
-            DrawTight(g, SettingTabs[i], chipFont, on ? Deep(a) : Ink(.8f * a), b.X + 12 * s, b.Y + th / 2);
+            DrawTight(g, SettingTabs[i], chipFont, on ? OnInk(a) : Ink(.8f * a), b.X + 12 * s, b.Y + th / 2);
             settingHits.Add((b, "tab", i));
             tx += tw + 6 * s;
         }
@@ -5090,6 +5095,7 @@ internal sealed class CapsuleWindow : Form
             "autohide" => L.T("顶部胶囊自动隐藏", "Auto-hide top capsule"),
             "tbstyle" => L.T("Windows 任务栏", "Windows taskbar"),
             "lang" => "语言 / Language",
+            "paste" => L.T("在桌面按 Ctrl+V 粘贴文件和图片", "Ctrl+V on desktop pastes files & images"),
             _ => L.T("开机自动启动", "Start with Windows"),
         };
         bool slider = key is "clarity" or "width" or "height" or "topgap";
@@ -5127,7 +5133,7 @@ internal sealed class CapsuleWindow : Form
                 if (on) FillRound(g, b, bh / 2, Ink(.92f * a));
                 else if (b.Contains(mouse)) FillRound(g, b, bh / 2, Ink(.12f * a));
                 float tw = Measure(names[i], chipFont) * s;
-                DrawTight(g, names[i], chipFont, on ? Deep(a) : Ink(.8f * a), b.X + (bw - tw) / 2, cy);
+                DrawTight(g, names[i], chipFont, on ? OnInk(a) : Ink(.8f * a), b.X + (bw - tw) / 2, cy);
                 settingHits.Add((b, key, i));
             }
         }
@@ -5139,7 +5145,7 @@ internal sealed class CapsuleWindow : Form
             float bw = Measure(text, chipFont) * s + 24 * s, bh = 26 * s;
             var b = new RectangleF(row.Right - bw - 4 * s, cy - bh / 2, bw, bh);
             FillRound(g, b, bh / 2, linked ? Ink(.10f * a) : hit.Contains(mouse) ? Ink(.9f * a) : Ink(.18f * a));
-            DrawTight(g, text, chipFont, !linked && hit.Contains(mouse) ? Deep(a) : Ink(.85f * a), b.X + 12 * s, cy);
+            DrawTight(g, text, chipFont, !linked && hit.Contains(mouse) ? OnInk(a) : Ink(.85f * a), b.X + 12 * s, cy);
             settingHits.Add((hit, key, 0));
         }
         else
@@ -5148,7 +5154,7 @@ internal sealed class CapsuleWindow : Form
             var sw = new RectangleF(row.Right - 40 * s - 4 * s, cy - 11 * s, 40 * s, 22 * s);
             FillRound(g, sw, 11 * s, on ? Ink(.9f * a) : Ink(.18f * a));
             float kx = on ? sw.Right - 11 * s : sw.X + 11 * s;
-            using (var knob = new SolidBrush(on ? Deep(a) : Ink(.9f * a))) g.FillEllipse(knob, kx - 8 * s, cy - 8 * s, 16 * s, 16 * s);
+            using (var knob = new SolidBrush(on ? OnInk(a) : Ink(.9f * a))) g.FillEllipse(knob, kx - 8 * s, cy - 8 * s, 16 * s, 16 * s);
             settingHits.Add((hit, key, 0));
         }
     }
@@ -5740,6 +5746,12 @@ internal sealed class CapsuleWindow : Form
                 SetQuery("");
                 return true;
             case Keys.Control | Keys.V:
+                // 开了“桌面粘贴”：复制的文件、图片放到桌面，在哪个分类页就收进哪个分类
+                if (app.Config.DesktopPaste && GlassBoxApp.ClipboardHasPasteable())
+                {
+                    app.PasteFromClipboard(CurrentPage is { Kind: PageKind.Fence, Fence: { } into } ? into : null);
+                    return true;
+                }
                 var text = Clipboard.ContainsText() ? Clipboard.GetText().Split('\n')[0].Trim() : "";
                 if (text.Length > 0) SetQuery(query + text);
                 return true;

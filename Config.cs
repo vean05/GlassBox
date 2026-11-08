@@ -19,6 +19,8 @@ internal sealed class AppConfig
     public bool HideSystemIcons { get; set; } = true;
     /// <summary>面板里把图标拖到右下角的“口”上（或选中按 Delete）：胶囊一口吞掉，丢进回收站，5 秒内可以撤销。文件夹不行。默认关。</summary>
     public bool TrashDrop { get; set; }
+    /// <summary>在桌面（或打开的胶囊）上按 Ctrl+V：复制的文件、图片存一份到桌面并收进分类。只新建、不覆盖，默认关。</summary>
+    public bool DesktopPaste { get; set; }
     public string GlassMode { get; set; } = "acrylic"; // acrylic：系统亚克力；accent：兼容模式
     /// <summary>capsule：顶部的流光胶囊；fences：桌面上的玻璃盒子。每个盒子在胶囊里就是一个分类。</summary>
     public string Layout { get; set; } = "capsule";

@@ -162,12 +162,23 @@ internal sealed class DesktopDoubleClickHook : IDisposable
 }
 
 /// <summary>
-/// 全局低级键盘钩子，只认“连按两下 Ctrl”：每下都是短按（不到 0.3 秒），两下间隔不到 0.4 秒，
-/// 中间没按别的键（Ctrl+C、Ctrl+V 这种组合键不会触发）。别的按键原样放过，不记录任何内容。
+/// 全局低级键盘钩子，只认两件事：
+/// “连按两下 Ctrl”：每下都是短按（不到 0.3 秒），两下间隔不到 0.4 秒，中间没按别的键；
+/// “在桌面上按 Ctrl+V”（开了“桌面粘贴”才管）：剪贴板里是文件或图片、焦点在桌面上时，这一下交给玻璃收纳，不再给资源管理器。
+/// 别的按键原样放过，不记录任何内容。
 /// </summary>
 internal sealed class DoubleCtrlHook : IDisposable
 {
-    const uint VK_CONTROL = 0x11, VK_LCONTROL = 0xA2, VK_RCONTROL = 0xA3;
+    const uint VK_CONTROL = 0x11, VK_LCONTROL = 0xA2, VK_RCONTROL = 0xA3, VK_V = 0x56;
+    const int VK_SHIFT = 0x10, VK_MENU = 0x12, VK_LWIN = 0x5B, VK_RWIN = 0x5C;
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+
+    /// <summary>连按两下 Ctrl 呼出胶囊（可以只开桌面粘贴、不开这个）。</summary>
+    public volatile bool Summon = true;
+    /// <summary>在钩子线程上问：这一下 Ctrl+V 要不要交给玻璃收纳。null = 不管粘贴。要快，不能卡。</summary>
+    public volatile Func<bool>? PasteHere;
+    /// <summary>在钩子线程上触发，用的人要自己切回界面线程。</summary>
+    public event Action? Paste;
     const uint TapMax = 300, GapMax = 400;
     readonly LowLevelKeyboardProc proc;
     readonly Action stop;
@@ -209,16 +220,32 @@ internal sealed class DoubleCtrlHook : IDisposable
                         if (taps >= 2)
                         {
                             taps = 0;
-                            Triggered?.Invoke();
+                            if (Summon) Triggered?.Invoke();
                         }
                     }
                     else taps = 0;
                 }
             }
-            else if (pressed) taps = 0;
+            else if (pressed)
+            {
+                taps = 0;
+                // 只认单纯的 Ctrl+V（Ctrl+Shift+V 之类留给别的程序）
+                if (info.vkCode == VK_V && down && PasteHere is { } ask && !Held(VK_SHIFT) && !Held(VK_MENU) && !Held(VK_LWIN) && !Held(VK_RWIN))
+                {
+                    bool mine = false;
+                    try { mine = ask(); } catch { }
+                    if (mine)
+                    {
+                        Paste?.Invoke();
+                        return 1; // 吞掉这一下：资源管理器不会再粘贴一次
+                    }
+                }
+            }
         }
         return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
     }
+
+    static bool Held(int key) => (GetAsyncKeyState(key) & 0x8000) != 0;
 
     public void Dispose() => stop();
 }

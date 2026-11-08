@@ -99,7 +99,7 @@ internal sealed class GlassBoxApp : ApplicationContext
         else if (DesktopShell.HidByUs) DesktopShell.SetIconsVisible(true); // 上次是被强制结束的、图标还藏着：还回来
         tray = CreateTray();
         EnableHook(Config.DoubleClickToHide);
-        EnableKeyHook(Config.DoubleCtrlToSummon);
+        UpdateKeyHook();
         StartWatchers();
         Tone.Changed += OnToneChanged;
         Tone.Reload(); // 后台读壁纸，读好之前胶囊先用默认颜色
@@ -1002,6 +1002,7 @@ internal sealed class GlassBoxApp : ApplicationContext
             ScheduleSave();
         }, check: Config.AutoSortNewFiles);
         settings.Add(L.T("隐藏系统桌面图标", "Hide system desktop icons"), () => SetHideSystemIcons(!Config.HideSystemIcons), check: Config.HideSystemIcons);
+        settings.Add(L.T("在桌面按 Ctrl+V 粘贴文件和图片", "Ctrl+V on desktop pastes files & images"), () => SetDesktopPaste(!Config.DesktopPaste), check: Config.DesktopPaste);
         if (!CapsuleMode)
             settings.Add(L.T("毛玻璃兼容模式（效果不对时再开）", "Glass compatibility mode (if blur looks wrong)"), () =>
             {
@@ -1033,7 +1034,7 @@ internal sealed class GlassBoxApp : ApplicationContext
     internal void SetDoubleCtrlToSummon(bool on)
     {
         Config.DoubleCtrlToSummon = on;
-        EnableKeyHook(on);
+        UpdateKeyHook();
         ScheduleSave();
     }
 
@@ -1131,18 +1132,161 @@ internal sealed class GlassBoxApp : ApplicationContext
         }
     }
 
-    void EnableKeyHook(bool on)
+    /// <summary>键盘钩子：连按两下 Ctrl、桌面粘贴，两个都关了就拆掉。</summary>
+    void UpdateKeyHook()
     {
-        if (on && keyHook == null)
+        bool summon = Config.DoubleCtrlToSummon, paste = Config.DesktopPaste;
+        if ((summon || paste) && keyHook == null)
         {
             keyHook = new DoubleCtrlHook();
             // 正在玩全屏游戏、放幻灯片时不响应：游戏里也常按 Ctrl，抢走焦点会把游戏切出去
             keyHook.Triggered += () => ui.BeginInvoke(new Action(() => { if (!FullscreenBusy()) capsule?.Summon(); }));
+            keyHook.Paste += () => ui.BeginInvoke(new Action(() => PasteFromClipboard(null)));
         }
-        else if (!on && keyHook != null)
+        else if (!summon && !paste && keyHook != null)
         {
             keyHook.Dispose();
             keyHook = null;
+        }
+        if (keyHook != null)
+        {
+            keyHook.Summon = summon;
+            keyHook.PasteHere = paste ? DesktopPasteWanted : null;
+        }
+    }
+
+    internal void SetDesktopPaste(bool on)
+    {
+        Config.DesktopPaste = on;
+        UpdateKeyHook();
+        ScheduleSave();
+    }
+
+    // ---------- 粘贴到桌面 ----------
+
+    const uint CF_BITMAP = 2, CF_DIB = 8, CF_HDROP = 15, CF_DIBV5 = 17;
+    static readonly uint CF_PNG = RegisterClipboardFormat("PNG");
+
+    /// <summary>
+    /// 在钩子线程上调，要快：焦点在桌面上、剪贴板里有文件或图片时才接手。
+    /// 系统图标显示着时，文件让资源管理器自己粘贴；图片资源管理器本来就粘贴不了，交给我们。
+    /// </summary>
+    static bool DesktopPasteWanted()
+    {
+        if (!DesktopShell.IsDesktopBackground(GetForegroundWindow())) return false;
+        if (IsClipboardFormatAvailable(CF_HDROP)) return DesktopShell.IconsVisible() != true;
+        return IsClipboardFormatAvailable(CF_DIB) || IsClipboardFormatAvailable(CF_DIBV5) || IsClipboardFormatAvailable(CF_BITMAP)
+            || (CF_PNG != 0 && IsClipboardFormatAvailable(CF_PNG));
+    }
+
+    /// <summary>剪贴板里有能放到桌面的东西（文件、图片）吗。界面线程上调。</summary>
+    internal static bool ClipboardHasPasteable()
+    {
+        try { return Clipboard.ContainsFileDropList() || (!Clipboard.ContainsText() && (Clipboard.ContainsImage() || Clipboard.ContainsData("PNG"))); }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// 把剪贴板里的文件复制一份、或者把图片存成 PNG，放到桌面上；into 不为空时收进那个分类（不然按类型自动收）。
+    /// 只新建文件：重名就加“ - 副本”，绝不覆盖。剪切（Ctrl+X）也当复制，原来的文件不动。
+    /// </summary>
+    internal bool PasteFromClipboard(FenceConfig? into)
+    {
+        IDataObject? data;
+        try { data = Clipboard.GetDataObject(); }
+        catch (Exception ex) { Log.Error(ex); return false; }
+        return data != null && PasteData(data, into, desktopDirs[0]);
+    }
+
+    internal bool PasteData(IDataObject data, FenceConfig? into, string desk)
+    {
+
+        if (data.GetDataPresent(DataFormats.FileDrop) && data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
+        {
+            // 大文件、文件夹可能要复制一会儿：放后台，界面不卡
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                var made = new List<string>();
+                foreach (var source in files)
+                {
+                    try { if (CopyToFolder(source, desk) is { } path) made.Add(path); }
+                    catch (Exception ex) { Log.Error(ex); }
+                }
+                Log.Info($"粘贴到桌面：{made.Count}/{files.Length} 个");
+                if (made.Count > 0 && into != null) ui.BeginInvoke(new Action(() => FileInto(made, into)));
+            });
+            return true;
+        }
+
+        Image? image = null;
+        try
+        {
+            // 有 PNG 格式就用它（透明背景不会变黑），不然用普通位图
+            if (data.GetDataPresent("PNG") && data.GetData("PNG") is MemoryStream png) image = Image.FromStream(png);
+            else if (data.GetDataPresent(DataFormats.Bitmap, true)) image = data.GetData(DataFormats.Bitmap, true) as Image;
+        }
+        catch (Exception ex) { Log.Error(ex); }
+        if (image == null) return false;
+        using (image)
+        {
+            string path = Unique(Path.Combine(desk, $"{L.T("粘贴的图片", "Pasted image")} {DateTime.Now:yyyy-MM-dd HHmmss}.png"));
+            try { image.Save(path, System.Drawing.Imaging.ImageFormat.Png); }
+            catch (Exception ex) { Log.Error(ex); return false; }
+            Log.Info("粘贴图片到桌面");
+            if (into != null) FileInto(new List<string> { path }, into);
+        }
+        return true;
+    }
+
+    void FileInto(List<string> paths, FenceConfig into)
+    {
+        if (exiting || !Config.Fences.Contains(into)) return;
+        var placed = Absorb(paths.ToArray(), into);
+        if (placed.Count > 0)
+            capsule?.ShowFiled(placed[0].Item, into, placed.Count > 1 ? L.T($"收纳了 {placed.Count} 个文件", $"Filed {placed.Count} items into") : L.T("已收进", "Filed into"));
+    }
+
+    static string? CopyToFolder(string source, string folder)
+    {
+        string name = Path.GetFileName(source.TrimEnd('\\'));
+        if (name.Length == 0) return null;
+        if (Directory.Exists(source))
+        {
+            string from = Path.GetFullPath(source).TrimEnd('\\') + "\\", into = Path.GetFullPath(folder).TrimEnd('\\') + "\\";
+            if (into.StartsWith(from, StringComparison.OrdinalIgnoreCase)) return null; // 不能把文件夹复制进它自己里面
+            string target = Unique(Path.Combine(folder, name));
+            CopyDirectory(source, target);
+            return target;
+        }
+        if (!File.Exists(source)) return null;
+        string file = Unique(Path.Combine(folder, name));
+        File.Copy(source, file, overwrite: false);
+        return file;
+    }
+
+    static void CopyDirectory(string from, string to)
+    {
+        Directory.CreateDirectory(to);
+        foreach (var file in Directory.GetFiles(from)) File.Copy(file, Path.Combine(to, Path.GetFileName(file)), overwrite: false);
+        foreach (var dir in Directory.GetDirectories(from))
+        {
+            if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0) continue; // 不跟进链接，免得绕圈
+            CopyDirectory(dir, Path.Combine(to, Path.GetFileName(dir)));
+        }
+    }
+
+    /// <summary>重名时像资源管理器一样加“ - 副本”“ - 副本 (2)”。</summary>
+    static string Unique(string path)
+    {
+        if (!File.Exists(path) && !Directory.Exists(path)) return path;
+        string dir = Path.GetDirectoryName(path)!;
+        string ext = Directory.Exists(path) ? "" : Path.GetExtension(path);
+        string stem = Path.GetFileName(path)[..^ext.Length];
+        string copy = L.T(" - 副本", " - Copy");
+        for (int i = 1; ; i++)
+        {
+            string candidate = Path.Combine(dir, stem + copy + (i > 1 ? $" ({i})" : "") + ext);
+            if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
         }
     }
 
@@ -1220,7 +1364,8 @@ internal sealed class GlassBoxApp : ApplicationContext
         exiting = true;
         SaveNow();
         EnableHook(false);
-        EnableKeyHook(false);
+        keyHook?.Dispose();
+        keyHook = null;
         media?.Dispose();
         downloadsFolderTimer.Dispose();
         foreach (var watcher in watchers) watcher.Dispose();
